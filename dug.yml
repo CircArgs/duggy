@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-genai-resources
+spec:
+  schedule: "0 * * * *"  # Runs every hour
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: dev-sa  # Ensure the SA has proper permissions
+          restartPolicy: Never
+          containers:
+            - name: cleanup-genai-resources
+              image: alpine:latest  # Lightweight base image
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  apk add --no-cache kubectl jq
+                  kubectl get all -o json | \
+                  jq -r '.items[] | select(.metadata.annotations."genai-dev-workflows" != null) |
+                         select((.metadata.creationTimestamp | fromdateiso8601) < (now - 129600)) |
+                         .kind + "/" + .metadata.name' | \
+                  xargs -r kubectl delete
+              env:
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace  # Retrieves the current namespace
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsUser: 1000
+                runAsGroup: 1000
+                readOnlyRootFilesystem: true
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
