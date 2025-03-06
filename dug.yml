@@ -8,26 +8,30 @@ spec:
     spec:
       template:
         spec:
-          serviceAccountName: dev-sa  # Ensure the SA has proper permissions
+          serviceAccountName: dev-sa  # Ensure SA has permissions
           restartPolicy: Never
           containers:
             - name: cleanup-genai-resources
-              image: alpine:latest  # Lightweight base image
+              image: bitnami/kubectl:latest  # Lightweight image with kubectl pre-installed
               command:
                 - /bin/sh
                 - -c
                 - |
-                  apk add --no-cache kubectl jq
-                  kubectl get all -o json | \
-                  jq -r '.items[] | select(.metadata.annotations."genai-dev-workflows" != null) |
-                         select((.metadata.creationTimestamp | fromdateiso8601) < (now - 129600)) |
-                         .kind + "/" + .metadata.name' | \
-                  xargs -r kubectl delete
+                  kubectl get all -o=jsonpath='{range .items[?(@.metadata.annotations.deployer)]}{.kind}/{.metadata.name} {.metadata.creationTimestamp}{"\n"}{end}' | \
+                  while read resource timestamp; do
+                    create_time=$(date -d "$timestamp" +%s)
+                    now=$(date +%s)
+                    age=$(( (now - create_time) / 3600 ))  # Convert to hours
+                    if [ "$age" -ge 36 ]; then
+                      echo "Deleting $resource (created $age hours ago)"
+                      kubectl delete "$resource"
+                    fi
+                  done
               env:
                 - name: NAMESPACE
                   valueFrom:
                     fieldRef:
-                      fieldPath: metadata.namespace  # Retrieves the current namespace
+                      fieldPath: metadata.namespace  # Runs in the current namespace only
               securityContext:
                 allowPrivilegeEscalation: false
                 runAsUser: 1000
