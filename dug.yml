@@ -1,45 +1,106 @@
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: cleanup-genai-resources
-spec:
-  schedule: "0 * * * *"  # Runs every hour
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          serviceAccountName: dev-sa  # Ensure SA has permissions
-          restartPolicy: Never
-          containers:
-            - name: cleanup-genai-resources
-              image: bitnami/kubectl:latest  # Lightweight image with kubectl pre-installed
-              command:
-                - /bin/sh
-                - -c
-                - |
-                  kubectl get all -o=jsonpath='{range .items[?(@.metadata.annotations.deployer)]}{.kind}/{.metadata.name} {.metadata.creationTimestamp}{"\n"}{end}' | \
-                  while read resource timestamp; do
-                    create_time=$(date -d "$timestamp" +%s)
-                    now=$(date +%s)
-                    age=$(( (now - create_time) / 3600 ))  # Convert to hours
-                    if [ "$age" -ge 36 ]; then
-                      echo "Deleting $resource (created $age hours ago)"
-                      kubectl delete "$resource"
-                    fi
-                  done
-              env:
-                - name: NAMESPACE
-                  valueFrom:
-                    fieldRef:
-                      fieldPath: metadata.namespace  # Runs in the current namespace only
-              securityContext:
-                allowPrivilegeEscalation: false
-                runAsUser: 1000
-                runAsGroup: 1000
-                readOnlyRootFilesystem: true
-              volumeMounts:
-                - name: tmp
-                  mountPath: /tmp
-          volumes:
-            - name: tmp
-              emptyDir: {}
+import pytest
+from typing import Any, Dict
+from your_module.types import Scope, ToolType, Validator, ToolRegistryType
+
+# Mock tool implementation for testing
+class MockTool:
+    @property
+    def name(self) -> str:
+        return "MockTool"
+
+    @property
+    def description(self) -> str:
+        return "A mock tool for testing."
+
+    @property
+    def scope(self) -> Scope:
+        return Scope.PUBLIC
+
+    @property
+    def default_inputs(self) -> Dict[str, Any]:
+        return {"input1": "default"}
+
+    @property
+    def default_outputs(self) -> Dict[str, Any]:
+        return {"output1": "default"}
+
+    @property
+    def parameters(self) -> Scope:
+        return Scope.PUBLIC
+
+    @property
+    def input_model(self) -> Dict[str, Any]:
+        return {"type": "object"}
+
+    @property
+    def output_model(self) -> Dict[str, Any]:
+        return {"type": "object"}
+
+    @property
+    def input_validator(self) -> Validator:
+        return lambda data: None  # Mock validator, does nothing
+
+    @property
+    def output_validator(self) -> Validator:
+        return lambda data: None  # Mock validator, does nothing
+
+    def invoke(self, **kwargs) -> Any:
+        return {"result": "success"}
+
+    async def async_invoke(self, **kwargs) -> Any:
+        return {"result": "success"}
+
+# Tests for Scope Enum
+def test_scope_enum():
+    assert Scope.PUBLIC == "public"
+    assert Scope.PROTECTED == "protected"
+    assert Scope.PRIVATE == "private"
+
+# Tests for MockTool adhering to ToolType protocol
+@pytest.fixture
+def mock_tool():
+    return MockTool()
+
+def test_tool_properties(mock_tool):
+    assert mock_tool.name == "MockTool"
+    assert mock_tool.description == "A mock tool for testing."
+    assert mock_tool.scope == Scope.PUBLIC
+    assert mock_tool.default_inputs == {"input1": "default"}
+    assert mock_tool.default_outputs == {"output1": "default"}
+    assert mock_tool.input_model == {"type": "object"}
+    assert mock_tool.output_model == {"type": "object"}
+
+def test_validators(mock_tool):
+    assert mock_tool.input_validator({"test": "data"}) is None
+    assert mock_tool.output_validator({"test": "data"}) is None
+
+def test_tool_invocation(mock_tool):
+    result = mock_tool.invoke()
+    assert result == {"result": "success"}
+
+@pytest.mark.asyncio
+async def test_tool_async_invocation(mock_tool):
+    result = await mock_tool.async_invoke()
+    assert result == {"result": "success"}
+
+# Tests for ToolRegistryType
+class MockToolRegistry:
+    def __init__(self):
+        self.registry = {}
+
+    def add_tool(self, tool: ToolType, metadata: Any) -> None:
+        self.registry[tool.name] = (tool, metadata)
+
+    def get_tool(self, query: Any) -> ToolType | None:
+        return self.registry.get(query, (None, None))[0]
+
+@pytest.fixture
+def mock_registry():
+    return MockToolRegistry()
+
+def test_tool_registry(mock_registry, mock_tool):
+    mock_registry.add_tool(mock_tool, {"meta": "data"})
+    retrieved_tool = mock_registry.get_tool("MockTool")
+    assert retrieved_tool == mock_tool
+
+    assert mock_registry.get_tool("NonExistentTool") is None
