@@ -1,27 +1,39 @@
 import os
 import json
 import http.client
-import ssl
 import datetime
+import ssl
 
-# Kubernetes API configuration
-KUBE_API_SERVER = "kubernetes.default.svc"
-NAMESPACE = os.getenv("NAMESPACE", "default")
-TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-CA_CERT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# Check if running inside a cluster or locally
+RUNNING_IN_CLUSTER = os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
 
-# Read the service account token
-with open(TOKEN_PATH, "r") as token_file:
-    TOKEN = token_file.read().strip()
+if RUNNING_IN_CLUSTER:
+    # Running inside a Kubernetes pod
+    KUBE_API_SERVER = "kubernetes.default.svc"
+    TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    CA_CERT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-# Setup SSL context
-ssl_context = ssl.create_default_context(cafile=CA_CERT_PATH)
+    # Read the service account token
+    with open(TOKEN_PATH, "r") as token_file:
+        TOKEN = token_file.read().strip()
+
+    # Setup SSL context
+    ssl_context = ssl.create_default_context(cafile=CA_CERT_PATH)
+else:
+    # Running locally, use kubectl proxy
+    KUBE_API_SERVER = "127.0.0.1:8001"
+    TOKEN = None  # No token needed for kubectl proxy
+    ssl_context = None  # Disable SSL for local testing
 
 # Function to make a GET request
 def fetch_k8s_data(path):
     try:
-        conn = http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context, timeout=10)
-        headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+        conn = http.client.HTTPConnection(KUBE_API_SERVER, timeout=10) if not RUNNING_IN_CLUSTER else http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context)
+        headers = {"Accept": "application/json"}
+        
+        if RUNNING_IN_CLUSTER:
+            headers["Authorization"] = f"Bearer {TOKEN}"
+        
         conn.request("GET", path, headers=headers)
         response = conn.getresponse()
 
@@ -45,8 +57,12 @@ def delete_resource(kind, name):
             print(f"Skipping unknown resource type: {kind}")
             return False
 
-        conn = http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context, timeout=10)
-        headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+        conn = http.client.HTTPConnection(KUBE_API_SERVER, timeout=10) if not RUNNING_IN_CLUSTER else http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context)
+        headers = {"Accept": "application/json"}
+
+        if RUNNING_IN_CLUSTER:
+            headers["Authorization"] = f"Bearer {TOKEN}"
+
         conn.request("DELETE", path, headers=headers)
         response = conn.getresponse()
 
@@ -80,6 +96,9 @@ def process_resources(resource_type, data):
         deployer = resource["metadata"].get("annotations", {}).get("deployer", "")
         if age_hours >= 36 and deployer == "genai-dev-workflows":
             delete_resource(kind, name)
+
+# Set namespace for testing (override if running locally)
+NAMESPACE = os.getenv("NAMESPACE", "default") if RUNNING_IN_CLUSTER else "default"
 
 # Fetch and process all resource types
 resource_paths = {
