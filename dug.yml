@@ -1,24 +1,102 @@
-apiVersion: v1
-kind: Pod
-metadata:
-  name: cleanup-job
-  namespace: default  # Change this if needed
-spec:
-  serviceAccountName: dev-sa  # Ensure this matches your Kubernetes RBAC service account
-  restartPolicy: Never  # Run the job once and exit
-  containers:
-    - name: cleanup-job
-      image: python:3.10  # Use official Python image
-      command: ["python3", "/app/cleanup.py"]
-      volumeMounts:
-        - name: script-volume
-          mountPath: /app
-      env:
-        - name: NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace  # Get the namespace dynamically
-  volumes:
-    - name: script-volume
-      configMap:
-        name: cleanup-script  # This will hold the Python script
+import os
+import datetime
+from kubernetes import client, config
+
+# Load Kubernetes config (automatically detects in-cluster or local)
+if os.getenv("KUBERNETES_SERVICE_HOST"):
+    config.load_incluster_config()  # Running inside a pod
+else:
+    config.load_kube_config()  # Running locally with kubectl
+
+# Kubernetes API clients
+core_api = client.CoreV1Api()
+apps_api = client.AppsV1Api()
+
+# Get namespace dynamically from environment
+NAMESPACE = os.getenv("NAMESPACE", "default")
+
+# Resource fetch functions
+def get_pods():
+    return core_api.list_namespaced_pod(NAMESPACE)
+
+def get_services():
+    return core_api.list_namespaced_service(NAMESPACE)
+
+def get_configmaps():
+    return core_api.list_namespaced_config_map(NAMESPACE)
+
+def get_secrets():
+    return core_api.list_namespaced_secret(NAMESPACE)
+
+def get_persistentvolumeclaims():
+    return core_api.list_namespaced_persistent_volume_claim(NAMESPACE)
+
+def get_deployments():
+    return apps_api.list_namespaced_deployment(NAMESPACE)
+
+def get_replicasets():
+    return apps_api.list_namespaced_replica_set(NAMESPACE)
+
+def get_statefulsets():
+    return apps_api.list_namespaced_stateful_set(NAMESPACE)
+
+def get_daemonsets():
+    return apps_api.list_namespaced_daemon_set(NAMESPACE)
+
+# Delete functions
+def delete_resource(kind, name):
+    try:
+        if kind == "Pod":
+            core_api.delete_namespaced_pod(name, NAMESPACE)
+        elif kind == "Service":
+            core_api.delete_namespaced_service(name, NAMESPACE)
+        elif kind == "ConfigMap":
+            core_api.delete_namespaced_config_map(name, NAMESPACE)
+        elif kind == "Secret":
+            core_api.delete_namespaced_secret(name, NAMESPACE)
+        elif kind == "PersistentVolumeClaim":
+            core_api.delete_namespaced_persistent_volume_claim(name, NAMESPACE)
+        elif kind == "Deployment":
+            apps_api.delete_namespaced_deployment(name, NAMESPACE)
+        elif kind == "ReplicaSet":
+            apps_api.delete_namespaced_replica_set(name, NAMESPACE)
+        elif kind == "StatefulSet":
+            apps_api.delete_namespaced_stateful_set(name, NAMESPACE)
+        elif kind == "DaemonSet":
+            apps_api.delete_namespaced_daemon_set(name, NAMESPACE)
+        else:
+            print(f"Skipping unknown resource type: {kind}")
+            return
+        print(f"Deleted {kind} {name} in namespace {NAMESPACE}")
+    except Exception as e:
+        print(f"Error deleting {kind} {name}: {e}")
+
+# Process resources and delete old ones
+def process_resources(resources, kind):
+    now = datetime.datetime.utcnow()
+
+    for resource in resources.items:
+        name = resource.metadata.name
+        created_time = resource.metadata.creation_timestamp
+
+        age_hours = (now - created_time).total_seconds() / 3600
+        deployer = resource.metadata.annotations.get("deployer", "")
+
+        if age_hours >= 36 and deployer == "genai-dev-workflows":
+            delete_resource(kind, name)
+
+# Fetch and process all resources
+resources_to_check = {
+    "Pod": get_pods,
+    "Service": get_services,
+    "ConfigMap": get_configmaps,
+    "Secret": get_secrets,
+    "PersistentVolumeClaim": get_persistentvolumeclaims,
+    "Deployment": get_deployments,
+    "ReplicaSet": get_replicasets,
+    "StatefulSet": get_statefulsets,
+    "DaemonSet": get_daemonsets,
+}
+
+for kind, fetch_func in resources_to_check.items():
+    process_resources(fetch_func(), kind)
