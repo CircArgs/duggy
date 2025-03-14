@@ -1,118 +1,24 @@
-import os
-import json
-import http.client
-import datetime
-import ssl
-
-# Check if running inside a cluster or locally
-RUNNING_IN_CLUSTER = os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
-
-if RUNNING_IN_CLUSTER:
-    # Running inside a Kubernetes pod
-    KUBE_API_SERVER = "kubernetes.default.svc"
-    TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    CA_CERT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-
-    # Read the service account token
-    with open(TOKEN_PATH, "r") as token_file:
-        TOKEN = token_file.read().strip()
-
-    # Setup SSL context
-    ssl_context = ssl.create_default_context(cafile=CA_CERT_PATH)
-else:
-    # Running locally, use kubectl proxy
-    KUBE_API_SERVER = "127.0.0.1:8001"
-    TOKEN = None  # No token needed for kubectl proxy
-    ssl_context = None  # Disable SSL for local testing
-
-# Function to make a GET request
-def fetch_k8s_data(path):
-    try:
-        conn = http.client.HTTPConnection(KUBE_API_SERVER, timeout=10) if not RUNNING_IN_CLUSTER else http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context)
-        headers = {"Accept": "application/json"}
-        
-        if RUNNING_IN_CLUSTER:
-            headers["Authorization"] = f"Bearer {TOKEN}"
-        
-        conn.request("GET", path, headers=headers)
-        response = conn.getresponse()
-
-        if response.status == 200:
-            return json.loads(response.read().decode("utf-8"))
-        else:
-            print(f"Failed to fetch {path}: {response.status} - {response.reason}")
-            return None
-    except Exception as e:
-        print(f"Error connecting to Kubernetes API: {e}")
-        return None
-
-# Function to delete a Kubernetes resource
-def delete_resource(kind, name):
-    try:
-        if kind in ["Pod", "Service", "ConfigMap", "Secret", "PersistentVolumeClaim"]:
-            path = f"/api/v1/namespaces/{NAMESPACE}/{kind.lower()}s/{name}"
-        elif kind in ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"]:
-            path = f"/apis/apps/v1/namespaces/{NAMESPACE}/{kind.lower()}s/{name}"
-        else:
-            print(f"Skipping unknown resource type: {kind}")
-            return False
-
-        conn = http.client.HTTPConnection(KUBE_API_SERVER, timeout=10) if not RUNNING_IN_CLUSTER else http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context)
-        headers = {"Accept": "application/json"}
-
-        if RUNNING_IN_CLUSTER:
-            headers["Authorization"] = f"Bearer {TOKEN}"
-
-        conn.request("DELETE", path, headers=headers)
-        response = conn.getresponse()
-
-        if response.status in [200, 202]:
-            print(f"Deleted {kind} {name} in namespace {NAMESPACE}")
-            return True
-        else:
-            print(f"Failed to delete {kind} {name}: {response.status} - {response.reason}")
-            return False
-    except Exception as e:
-        print(f"Error deleting {kind} {name}: {e}")
-        return False
-
-# Function to process resources and delete old ones
-def process_resources(resource_type, data):
-    if not data or "items" not in data:
-        return
-    
-    now = datetime.datetime.utcnow()
-    
-    for resource in data["items"]:
-        kind = resource["kind"]
-        name = resource["metadata"]["name"]
-        created_str = resource["metadata"]["creationTimestamp"]
-        
-        # Parse creation time and calculate age
-        created_time = datetime.datetime.strptime(created_str.replace("Z", ""), "%Y-%m-%dT%H:%M:%S.%f")
-        age_hours = (now - created_time).total_seconds() / 3600
-
-        # Check if resource is older than 36 hours and was created by "genai-dev-workflows"
-        deployer = resource["metadata"].get("annotations", {}).get("deployer", "")
-        if age_hours >= 36 and deployer == "genai-dev-workflows":
-            delete_resource(kind, name)
-
-# Set namespace for testing (override if running locally)
-NAMESPACE = os.getenv("NAMESPACE", "default") if RUNNING_IN_CLUSTER else "default"
-
-# Fetch and process all resource types
-resource_paths = {
-    "pods": f"/api/v1/namespaces/{NAMESPACE}/pods",
-    "services": f"/api/v1/namespaces/{NAMESPACE}/services",
-    "configmaps": f"/api/v1/namespaces/{NAMESPACE}/configmaps",
-    "secrets": f"/api/v1/namespaces/{NAMESPACE}/secrets",
-    "persistentvolumeclaims": f"/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims",
-    "deployments": f"/apis/apps/v1/namespaces/{NAMESPACE}/deployments",
-    "replicasets": f"/apis/apps/v1/namespaces/{NAMESPACE}/replicasets",
-    "statefulsets": f"/apis/apps/v1/namespaces/{NAMESPACE}/statefulsets",
-    "daemonsets": f"/apis/apps/v1/namespaces/{NAMESPACE}/daemonsets"
-}
-
-for resource_type, path in resource_paths.items():
-    data = fetch_k8s_data(path)
-    process_resources(resource_type, data)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cleanup-job
+  namespace: default  # Change this if needed
+spec:
+  serviceAccountName: dev-sa  # Ensure this matches your Kubernetes RBAC service account
+  restartPolicy: Never  # Run the job once and exit
+  containers:
+    - name: cleanup-job
+      image: python:3.10  # Use official Python image
+      command: ["python3", "/app/cleanup.py"]
+      volumeMounts:
+        - name: script-volume
+          mountPath: /app
+      env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace  # Get the namespace dynamically
+  volumes:
+    - name: script-volume
+      configMap:
+        name: cleanup-script  # This will hold the Python script
