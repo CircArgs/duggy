@@ -1,71 +1,99 @@
 import os
-import time
-import requests
-import logging
+import json
+import http.client
+import ssl
+import datetime
 
-class FileSyncHandler(FileSystemEventHandler):
-    def __init__(self, local_dir, server_url):
-        self.local_dir = local_dir
-        self.server_url = server_url
+# Kubernetes API configuration
+KUBE_API_SERVER = "kubernetes.default.svc"
+NAMESPACE = os.getenv("NAMESPACE", "default")
+TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+CA_CERT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-    def is_valid_file(self, path):
-        """Check if a file is valid for syncing."""
-        return os.path.exists(path) and os.path.isfile(path)
+# Read the service account token
+with open(TOKEN_PATH, "r") as token_file:
+    TOKEN = token_file.read().strip()
 
-    def upload_file(self, file_path):
-        """Upload a file with error handling and retries."""
-        if not self.is_valid_file(file_path):
-            logging.warning(f"File not found or invalid: {file_path}")
-            return
+# Setup SSL context
+ssl_context = ssl.create_default_context(cafile=CA_CERT_PATH)
 
-        relative_path = os.path.relpath(file_path, self.local_dir)
-        attempts = 3
-        for attempt in range(attempts):
-            try:
-                with open(file_path, "rb") as file:
-                    response = requests.post(
-                        f"{self.server_url}/update-file/",
-                        data={"filepath": relative_path},
-                        files={"file": file},
-                        timeout=5
-                    )
+# Function to make a GET request
+def fetch_k8s_data(path):
+    try:
+        conn = http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context, timeout=10)
+        headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
 
-                if response.status_code == 200:
-                    logging.info(f"Uploaded: {relative_path} - {response.status_code}")
-                    return
-                else:
-                    logging.error(f"Failed to upload {relative_path}, retrying...")
-            except (requests.RequestException, IOError) as e:
-                logging.error(f"Error uploading {relative_path}: {e}")
+        if response.status == 200:
+            return json.loads(response.read().decode("utf-8"))
+        else:
+            print(f"Failed to fetch {path}: {response.status} - {response.reason}")
+            return None
+    except Exception as e:
+        print(f"Error connecting to Kubernetes API: {e}")
+        return None
 
-            time.sleep(2)  # Wait before retrying
+# Function to delete a Kubernetes resource
+def delete_resource(kind, name):
+    try:
+        if kind in ["Pod", "Service", "ConfigMap", "Secret", "PersistentVolumeClaim"]:
+            path = f"/api/v1/namespaces/{NAMESPACE}/{kind.lower()}s/{name}"
+        elif kind in ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"]:
+            path = f"/apis/apps/v1/namespaces/{NAMESPACE}/{kind.lower()}s/{name}"
+        else:
+            print(f"Skipping unknown resource type: {kind}")
+            return False
 
-        logging.error(f"Failed to upload {relative_path} after {attempts} attempts.")
+        conn = http.client.HTTPSConnection(KUBE_API_SERVER, 443, context=ssl_context, timeout=10)
+        headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+        conn.request("DELETE", path, headers=headers)
+        response = conn.getresponse()
 
-    def delete_file(self, file_path):
-        """Delete a file with error handling."""
-        relative_path = os.path.relpath(file_path, self.local_dir)
-        try:
-            response = requests.delete(
-                f"{self.server_url}/delete-file/",
-                data={"filepath": relative_path},
-                timeout=5
-            )
+        if response.status in [200, 202]:
+            print(f"Deleted {kind} {name} in namespace {NAMESPACE}")
+            return True
+        else:
+            print(f"Failed to delete {kind} {name}: {response.status} - {response.reason}")
+            return False
+    except Exception as e:
+        print(f"Error deleting {kind} {name}: {e}")
+        return False
 
-            if response.status_code == 200:
-                logging.info(f"Deleted: {relative_path} - {response.status_code}")
-            else:
-                logging.error(f"Failed to delete {relative_path}, server responded with {response.status_code}")
-        except requests.RequestException as e:
-            logging.error(f"Network error while deleting {relative_path}: {e}")
+# Function to process resources and delete old ones
+def process_resources(resource_type, data):
+    if not data or "items" not in data:
+        return
+    
+    now = datetime.datetime.utcnow()
+    
+    for resource in data["items"]:
+        kind = resource["kind"]
+        name = resource["metadata"]["name"]
+        created_str = resource["metadata"]["creationTimestamp"]
+        
+        # Parse creation time and calculate age
+        created_time = datetime.datetime.strptime(created_str.replace("Z", ""), "%Y-%m-%dT%H:%M:%S.%f")
+        age_hours = (now - created_time).total_seconds() / 3600
 
-    def on_created(self, event):
-        """Handle file creation event with delay to avoid race conditions."""
-        if not event.is_directory:
-            time.sleep(1)  # Give time for file to be fully written
-            self.upload_file(event.src_path)
+        # Check if resource is older than 36 hours and was created by "genai-dev-workflows"
+        deployer = resource["metadata"].get("annotations", {}).get("deployer", "")
+        if age_hours >= 36 and deployer == "genai-dev-workflows":
+            delete_resource(kind, name)
 
-    def on_deleted(self, event):
-        """Handle file deletion event safely."""
-        if not event.is_directory:
-            self.delete_file(event.src_path)
+# Fetch and process all resource types
+resource_paths = {
+    "pods": f"/api/v1/namespaces/{NAMESPACE}/pods",
+    "services": f"/api/v1/namespaces/{NAMESPACE}/services",
+    "configmaps": f"/api/v1/namespaces/{NAMESPACE}/configmaps",
+    "secrets": f"/api/v1/namespaces/{NAMESPACE}/secrets",
+    "persistentvolumeclaims": f"/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims",
+    "deployments": f"/apis/apps/v1/namespaces/{NAMESPACE}/deployments",
+    "replicasets": f"/apis/apps/v1/namespaces/{NAMESPACE}/replicasets",
+    "statefulsets": f"/apis/apps/v1/namespaces/{NAMESPACE}/statefulsets",
+    "daemonsets": f"/apis/apps/v1/namespaces/{NAMESPACE}/daemonsets"
+}
+
+for resource_type, path in resource_paths.items():
+    data = fetch_k8s_data(path)
+    process_resources(resource_type, data)
