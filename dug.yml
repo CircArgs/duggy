@@ -1,153 +1,148 @@
+# test_registry.py
 import pytest
-import asyncio
+from c1.genai.compound_ai.tools.registry import ToolRegistry
 from c1.genai.compound_ai.tools.tool import Tool
 from c1.genai.compound_ai.tools.types import Scope
 
-# Fixtures for single-parameter tests.
 @pytest.fixture
-def input_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "x": {"type": "number", "scope": "public"}
-        },
-        "required": ["x"]
-    }
-
-@pytest.fixture
-def output_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "result": {"type": "number", "scope": "public"}
-        },
-        "required": ["result"]
-    }
-
-# Dummy synchronous function: doubles the input.
-@pytest.fixture
-def double_func():
-    def double(x: float) -> dict:
-        return {"result": x * 2}
-    return double
-
-# Dummy asynchronous function: doubles the input.
-@pytest.fixture
-def async_double():
-    async def async_double(x: float) -> dict:
-        return {"result": x * 2}
-    return async_double
-
-def test_invoke_valid(input_schema, output_schema, double_func):
-    tool = Tool(
-        name="double",
-        description="Doubles a number",
-        input_model=input_schema,
-        output_model=output_schema,
-        scope=Scope.PUBLIC,
-        func=double_func
-    )
-    result = tool.invoke(x=5)
-    assert result == {"result": 10}
-
-def test_invoke_invalid_input(input_schema, output_schema, double_func):
-    tool = Tool(
-        name="double",
-        description="Doubles a number",
-        input_model=input_schema,
-        output_model=output_schema,
-        scope=Scope.PUBLIC,
-        func=double_func
-    )
-    with pytest.raises(ValueError):
-        tool.invoke(x="not a number")
-
-def test_invoke_invalid_output(input_schema, output_schema):
-    # Function returning output not matching schema.
-    def bad_func(x: float) -> dict:
-        return {"incorrect": x}
-    
-    tool = Tool(
-        name="bad_tool",
-        description="Returns invalid output",
-        input_model=input_schema,
-        output_model=output_schema,
-        scope=Scope.PUBLIC,
-        func=bad_func
-    )
-    with pytest.raises(ValueError):
-        tool.invoke(x=5)
-
-@pytest.mark.asyncio
-async def test_ainvoke_valid(input_schema, output_schema, async_double):
-    tool = Tool(
-        name="async_double",
-        description="Doubles a number asynchronously",
-        input_model=input_schema,
-        output_model=output_schema,
-        scope=Scope.PUBLIC,
-        coroutine=async_double
-    )
-    result = await tool.ainvoke(x=7)
-    assert result == {"result": 14}
-
-def test_rescope(input_schema, output_schema, double_func):
-    tool = Tool(
-        name="double",
-        description="Doubles a number",
-        input_model=input_schema,
-        output_model=output_schema,
-        scope=Scope.PUBLIC,
-        func=double_func,
-        default_inputs={"x": 1},
-        default_outputs={"result": 2}
-    )
-    new_scope = Scope.PRIVATE
-    new_tool = tool.rescope(new_scope, default_inputs={"x": 3}, default_outputs={"result": 6})
-    assert new_tool.scope == new_scope
-    assert new_tool.default_inputs == {"x": 3}
-    assert new_tool.default_outputs == {"result": 6}
-
-def test_partial_defaults():
+def clear_registry():
     """
-    Test a function with multiple arguments where only some have default values.
-    In this example, the function adds two numbers, and a default is provided for 'y'.
+    A fixture to clear the registry before each test.
+    Because ToolRegistry is a singleton, we need to ensure we're starting from a clean state.
     """
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "x": {"type": "number", "scope": "public"},
-            "y": {"type": "number", "scope": "public"}
-        },
-        "required": ["x", "y"]
-    }
-    output_schema = {
-        "type": "object",
-        "properties": {
-            "result": {"type": "number", "scope": "public"}
-        },
-        "required": ["result"]
-    }
-    
-    # Function that sums two numbers.
-    def add(x: float, y: float) -> dict:
-        return {"result": x + y}
-    
-    # Provide a default for 'y' only.
-    tool = Tool(
-        name="add",
-        description="Adds two numbers",
-        input_model=input_schema,
-        output_model=output_schema,
+    registry = ToolRegistry()
+    registry._registry.clear()  # Accessing the protected member to clear it for test isolation.
+    return registry
+
+def test_singleton_behavior(clear_registry):
+    """
+    Ensure that multiple instantiations of ToolRegistry refer to the same underlying instance.
+    """
+    first_registry = clear_registry
+    second_registry = ToolRegistry()
+    assert first_registry is second_registry, "ToolRegistry is not acting as a singleton."
+
+def test_add_and_get_tool(clear_registry):
+    """
+    Verify that adding a tool to the registry allows retrieval by name.
+    """
+    registry = clear_registry
+
+    # Create a dummy Tool instance. Real tests might use actual functions or a mock.
+    dummy_tool = Tool(
+        name="dummy",
+        description="A dummy tool for testing.",
+        input_model={"type": "object", "properties": {}},
+        output_model={"type": "object", "properties": {}},
         scope=Scope.PUBLIC,
-        func=add,
-        default_inputs={"y": 10}
+        func=lambda: {"result": "ok"}
     )
+    registry.add_tool(dummy_tool)
+
+    retrieved_tool = registry.get_tool("dummy")
+    assert retrieved_tool is dummy_tool, "Retrieved tool is not the same as the added tool."
+
+def test_get_tool_not_found(clear_registry):
+    """
+    Ensure that getting a tool by name returns None if it doesn't exist.
+    """
+    registry = clear_registry
+    retrieved = registry.get_tool("does_not_exist")
+    assert retrieved is None, "Expected None when retrieving a nonexistent tool."
+
+def test_list_tools(clear_registry):
+    """
+    Verify that listing tools returns all registered tools.
+    """
+    registry = clear_registry
+    tool_a = Tool(
+        name="tool_a",
+        description="Tool A",
+        input_model={"type": "object", "properties": {}},
+        output_model={"type": "object", "properties": {}},
+        scope=Scope.PUBLIC,
+        func=lambda: {"result": "A"}
+    )
+    tool_b = Tool(
+        name="tool_b",
+        description="Tool B",
+        input_model={"type": "object", "properties": {}},
+        output_model={"type": "object", "properties": {}},
+        scope=Scope.PUBLIC,
+        func=lambda: {"result": "B"}
+    )
+
+    registry.add_tool(tool_a)
+    registry.add_tool(tool_b)
+
+    all_tools = registry.list_tools()
+    assert len(all_tools) == 2, "Expected two tools in registry."
+    assert tool_a in all_tools, "Tool A not found in registry list."
+    assert tool_b in all_tools, "Tool B not found in registry list."
+
+def test_overwrite_tool(clear_registry):
+    """
+    If a new tool is added with the same name, verify behavior.
+    (Depending on your design, you could raise an error instead.)
+    """
+    registry = clear_registry
+    original_tool = Tool(
+        name="overwrite",
+        description="Original tool",
+        input_model={"type": "object", "properties": {}},
+        output_model={"type": "object", "properties": {}},
+        scope=Scope.PUBLIC,
+        func=lambda: {"result": "original"}
+    )
+    replacement_tool = Tool(
+        name="overwrite",
+        description="Replacement tool",
+        input_model={"type": "object", "properties": {}},
+        output_model={"type": "object", "properties": {}},
+        scope=Scope.PUBLIC,
+        func=lambda: {"result": "replacement"}
+    )
+
+    registry.add_tool(original_tool)
+    registry.add_tool(replacement_tool)
+    current_tool = registry.get_tool("overwrite")
+    assert current_tool is replacement_tool, "ToolRegistry did not overwrite as expected."
+
+def test_cross_library_behavior(clear_registry):
+    """
+    Test that a tool registered by one 'library' (the 'author library') is visible
+    to another 'library' (the 'user library') via the same registry singleton.
     
-    # When only 'x' is provided, 'y' should default to 10.
-    result = tool.invoke(x=5)
-    assert result == {"result": 15}
-    
-    # When 'y' is provided explicitly, it should override the default.
-    result_override = tool.invoke(x=5, y=20)
-    assert result_override == {"result": 25}
+    In real code, these would live in separate packages/modules, but this test simulates
+    that scenario by having both libraries import the exact same ToolRegistry path.
+    """
+
+    # Simulate "author library" code.
+    def register_author_tool():
+        registry = ToolRegistry()  # same import path as user
+        author_tool = Tool(
+            name="author_tool",
+            description="Tool from the author library",
+            input_model={"type": "object", "properties": {}},
+            output_model={"type": "object", "properties": {}},
+            scope=Scope.PUBLIC,
+            func=lambda: {"result": "author"}
+        )
+        registry.add_tool(author_tool)
+
+    # Simulate "user library" code.
+    def get_registered_tools():
+        registry = ToolRegistry()  # same import path as author
+        return registry.list_tools()
+
+    # Step 1: Author library registers its tool.
+    register_author_tool()
+
+    # Step 2: User library retrieves what's in the registry.
+    tools = get_registered_tools()
+    tool_names = [t.name for t in tools]
+
+    assert "author_tool" in tool_names, (
+        "Expected to find the tool registered by the author library. "
+        "The user library doesn't see it, which suggests a mismatch in imports!"
+    )
