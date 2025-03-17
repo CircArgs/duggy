@@ -1,102 +1,153 @@
-import os
-import datetime
-from kubernetes import client, config
+import pytest
+import asyncio
+from c1.genai.compound_ai.tools.tool import Tool
+from c1.genai.compound_ai.tools.types import Scope
 
-# Load Kubernetes config (automatically detects in-cluster or local)
-if os.getenv("KUBERNETES_SERVICE_HOST"):
-    config.load_incluster_config()  # Running inside a pod
-else:
-    config.load_kube_config()  # Running locally with kubectl
+# Fixtures for single-parameter tests.
+@pytest.fixture
+def input_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "x": {"type": "number", "scope": "public"}
+        },
+        "required": ["x"]
+    }
 
-# Kubernetes API clients
-core_api = client.CoreV1Api()
-apps_api = client.AppsV1Api()
+@pytest.fixture
+def output_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "result": {"type": "number", "scope": "public"}
+        },
+        "required": ["result"]
+    }
 
-# Get namespace dynamically from environment
-NAMESPACE = os.getenv("NAMESPACE", "default")
+# Dummy synchronous function: doubles the input.
+@pytest.fixture
+def double_func():
+    def double(x: float) -> dict:
+        return {"result": x * 2}
+    return double
 
-# Resource fetch functions
-def get_pods():
-    return core_api.list_namespaced_pod(NAMESPACE)
+# Dummy asynchronous function: doubles the input.
+@pytest.fixture
+def async_double():
+    async def async_double(x: float) -> dict:
+        return {"result": x * 2}
+    return async_double
 
-def get_services():
-    return core_api.list_namespaced_service(NAMESPACE)
+def test_invoke_valid(input_schema, output_schema, double_func):
+    tool = Tool(
+        name="double",
+        description="Doubles a number",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        func=double_func
+    )
+    result = tool.invoke(x=5)
+    assert result == {"result": 10}
 
-def get_configmaps():
-    return core_api.list_namespaced_config_map(NAMESPACE)
+def test_invoke_invalid_input(input_schema, output_schema, double_func):
+    tool = Tool(
+        name="double",
+        description="Doubles a number",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        func=double_func
+    )
+    with pytest.raises(ValueError):
+        tool.invoke(x="not a number")
 
-def get_secrets():
-    return core_api.list_namespaced_secret(NAMESPACE)
+def test_invoke_invalid_output(input_schema, output_schema):
+    # Function returning output not matching schema.
+    def bad_func(x: float) -> dict:
+        return {"incorrect": x}
+    
+    tool = Tool(
+        name="bad_tool",
+        description="Returns invalid output",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        func=bad_func
+    )
+    with pytest.raises(ValueError):
+        tool.invoke(x=5)
 
-def get_persistentvolumeclaims():
-    return core_api.list_namespaced_persistent_volume_claim(NAMESPACE)
+@pytest.mark.asyncio
+async def test_ainvoke_valid(input_schema, output_schema, async_double):
+    tool = Tool(
+        name="async_double",
+        description="Doubles a number asynchronously",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        coroutine=async_double
+    )
+    result = await tool.ainvoke(x=7)
+    assert result == {"result": 14}
 
-def get_deployments():
-    return apps_api.list_namespaced_deployment(NAMESPACE)
+def test_rescope(input_schema, output_schema, double_func):
+    tool = Tool(
+        name="double",
+        description="Doubles a number",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        func=double_func,
+        default_inputs={"x": 1},
+        default_outputs={"result": 2}
+    )
+    new_scope = Scope.PRIVATE
+    new_tool = tool.rescope(new_scope, default_inputs={"x": 3}, default_outputs={"result": 6})
+    assert new_tool.scope == new_scope
+    assert new_tool.default_inputs == {"x": 3}
+    assert new_tool.default_outputs == {"result": 6}
 
-def get_replicasets():
-    return apps_api.list_namespaced_replica_set(NAMESPACE)
-
-def get_statefulsets():
-    return apps_api.list_namespaced_stateful_set(NAMESPACE)
-
-def get_daemonsets():
-    return apps_api.list_namespaced_daemon_set(NAMESPACE)
-
-# Delete functions
-def delete_resource(kind, name):
-    try:
-        if kind == "Pod":
-            core_api.delete_namespaced_pod(name, NAMESPACE)
-        elif kind == "Service":
-            core_api.delete_namespaced_service(name, NAMESPACE)
-        elif kind == "ConfigMap":
-            core_api.delete_namespaced_config_map(name, NAMESPACE)
-        elif kind == "Secret":
-            core_api.delete_namespaced_secret(name, NAMESPACE)
-        elif kind == "PersistentVolumeClaim":
-            core_api.delete_namespaced_persistent_volume_claim(name, NAMESPACE)
-        elif kind == "Deployment":
-            apps_api.delete_namespaced_deployment(name, NAMESPACE)
-        elif kind == "ReplicaSet":
-            apps_api.delete_namespaced_replica_set(name, NAMESPACE)
-        elif kind == "StatefulSet":
-            apps_api.delete_namespaced_stateful_set(name, NAMESPACE)
-        elif kind == "DaemonSet":
-            apps_api.delete_namespaced_daemon_set(name, NAMESPACE)
-        else:
-            print(f"Skipping unknown resource type: {kind}")
-            return
-        print(f"Deleted {kind} {name} in namespace {NAMESPACE}")
-    except Exception as e:
-        print(f"Error deleting {kind} {name}: {e}")
-
-# Process resources and delete old ones
-def process_resources(resources, kind):
-    now = datetime.datetime.utcnow()
-
-    for resource in resources.items:
-        name = resource.metadata.name
-        created_time = resource.metadata.creation_timestamp
-
-        age_hours = (now - created_time).total_seconds() / 3600
-        deployer = resource.metadata.annotations.get("deployer", "")
-
-        if age_hours >= 36 and deployer == "genai-dev-workflows":
-            delete_resource(kind, name)
-
-# Fetch and process all resources
-resources_to_check = {
-    "Pod": get_pods,
-    "Service": get_services,
-    "ConfigMap": get_configmaps,
-    "Secret": get_secrets,
-    "PersistentVolumeClaim": get_persistentvolumeclaims,
-    "Deployment": get_deployments,
-    "ReplicaSet": get_replicasets,
-    "StatefulSet": get_statefulsets,
-    "DaemonSet": get_daemonsets,
-}
-
-for kind, fetch_func in resources_to_check.items():
-    process_resources(fetch_func(), kind)
+def test_partial_defaults():
+    """
+    Test a function with multiple arguments where only some have default values.
+    In this example, the function adds two numbers, and a default is provided for 'y'.
+    """
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "number", "scope": "public"},
+            "y": {"type": "number", "scope": "public"}
+        },
+        "required": ["x", "y"]
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "result": {"type": "number", "scope": "public"}
+        },
+        "required": ["result"]
+    }
+    
+    # Function that sums two numbers.
+    def add(x: float, y: float) -> dict:
+        return {"result": x + y}
+    
+    # Provide a default for 'y' only.
+    tool = Tool(
+        name="add",
+        description="Adds two numbers",
+        input_model=input_schema,
+        output_model=output_schema,
+        scope=Scope.PUBLIC,
+        func=add,
+        default_inputs={"y": 10}
+    )
+    
+    # When only 'x' is provided, 'y' should default to 10.
+    result = tool.invoke(x=5)
+    assert result == {"result": 15}
+    
+    # When 'y' is provided explicitly, it should override the default.
+    result_override = tool.invoke(x=5, y=20)
+    assert result_override == {"result": 25}
