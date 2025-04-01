@@ -1,148 +1,169 @@
-# test_registry.py
-import pytest
-from c1.genai.compound_ai.tools.registry import ToolRegistry
-from c1.genai.compound_ai.tools.tool import Tool
-from c1.genai.compound_ai.tools.types import Scope
+import inspect
+import asyncio
+import functools
+from dataclasses import dataclass
+from typing import Any, Callable, get_origin, get_args
 
-@pytest.fixture
-def clear_registry():
-    """
-    A fixture to clear the registry before each test.
-    Because ToolRegistry is a singleton, we need to ensure we're starting from a clean state.
-    """
-    registry = ToolRegistry()
-    registry._registry.clear()  # Accessing the protected member to clear it for test isolation.
-    return registry
+# This dataclass is meant to be used as extra annotation metadata for function parameters.
+@dataclass
+class ArgInfo:
+    description: str = ""
+    scope: str = "public"  # could be any string representing a scope, e.g. "public", "private", etc.
 
-def test_singleton_behavior(clear_registry):
-    """
-    Ensure that multiple instantiations of ToolRegistry refer to the same underlying instance.
-    """
-    first_registry = clear_registry
-    second_registry = ToolRegistry()
-    assert first_registry is second_registry, "ToolRegistry is not acting as a singleton."
+# A simple mapping function from basic Python types to JSON Schema types.
+def type_to_jsonschema(py_type: type) -> dict:
+    if py_type is int:
+        return {"type": "integer"}
+    elif py_type is float:
+        return {"type": "number"}
+    elif py_type is str:
+        return {"type": "string"}
+    elif py_type is bool:
+        return {"type": "boolean"}
+    elif py_type is list:
+        return {"type": "array"}
+    elif py_type is dict:
+        return {"type": "object"}
+    else:
+        # Fallback: for unsupported types, default to "object"
+        return {"type": "object"}
 
-def test_add_and_get_tool(clear_registry):
+def tool(*d_args, **d_kwargs):
     """
-    Verify that adding a tool to the registry allows retrieval by name.
-    """
-    registry = clear_registry
-
-    # Create a dummy Tool instance. Real tests might use actual functions or a mock.
-    dummy_tool = Tool(
-        name="dummy",
-        description="A dummy tool for testing.",
-        input_model={"type": "object", "properties": {}},
-        output_model={"type": "object", "properties": {}},
-        scope=Scope.PUBLIC,
-        func=lambda: {"result": "ok"}
-    )
-    registry.add_tool(dummy_tool)
-
-    retrieved_tool = registry.get_tool("dummy")
-    assert retrieved_tool is dummy_tool, "Retrieved tool is not the same as the added tool."
-
-def test_get_tool_not_found(clear_registry):
-    """
-    Ensure that getting a tool by name returns None if it doesn't exist.
-    """
-    registry = clear_registry
-    retrieved = registry.get_tool("does_not_exist")
-    assert retrieved is None, "Expected None when retrieving a nonexistent tool."
-
-def test_list_tools(clear_registry):
-    """
-    Verify that listing tools returns all registered tools.
-    """
-    registry = clear_registry
-    tool_a = Tool(
-        name="tool_a",
-        description="Tool A",
-        input_model={"type": "object", "properties": {}},
-        output_model={"type": "object", "properties": {}},
-        scope=Scope.PUBLIC,
-        func=lambda: {"result": "A"}
-    )
-    tool_b = Tool(
-        name="tool_b",
-        description="Tool B",
-        input_model={"type": "object", "properties": {}},
-        output_model={"type": "object", "properties": {}},
-        scope=Scope.PUBLIC,
-        func=lambda: {"result": "B"}
-    )
-
-    registry.add_tool(tool_a)
-    registry.add_tool(tool_b)
-
-    all_tools = registry.list_tools()
-    assert len(all_tools) == 2, "Expected two tools in registry."
-    assert tool_a in all_tools, "Tool A not found in registry list."
-    assert tool_b in all_tools, "Tool B not found in registry list."
-
-def test_overwrite_tool(clear_registry):
-    """
-    If a new tool is added with the same name, verify behavior.
-    (Depending on your design, you could raise an error instead.)
-    """
-    registry = clear_registry
-    original_tool = Tool(
-        name="overwrite",
-        description="Original tool",
-        input_model={"type": "object", "properties": {}},
-        output_model={"type": "object", "properties": {}},
-        scope=Scope.PUBLIC,
-        func=lambda: {"result": "original"}
-    )
-    replacement_tool = Tool(
-        name="overwrite",
-        description="Replacement tool",
-        input_model={"type": "object", "properties": {}},
-        output_model={"type": "object", "properties": {}},
-        scope=Scope.PUBLIC,
-        func=lambda: {"result": "replacement"}
-    )
-
-    registry.add_tool(original_tool)
-    registry.add_tool(replacement_tool)
-    current_tool = registry.get_tool("overwrite")
-    assert current_tool is replacement_tool, "ToolRegistry did not overwrite as expected."
-
-def test_cross_library_behavior(clear_registry):
-    """
-    Test that a tool registered by one 'library' (the 'author library') is visible
-    to another 'library' (the 'user library') via the same registry singleton.
+    Decorator to convert a callable into a Tool.
     
-    In real code, these would live in separate packages/modules, but this test simulates
-    that scenario by having both libraries import the exact same ToolRegistry path.
+    Optional keyword arguments:
+      - name: Name for the tool (defaults to function's __name__)
+      - description: Description for the tool (defaults to function's __doc__)
+      - input_model: Explicit JSON schema for inputs.
+      - output_model: Explicit JSON schema for outputs.
+      - scope: Tool scope (if not provided, defaults to Scope.PUBLIC)
+      - default_inputs: Dict of default input values.
+      - default_outputs: Dict of default output values.
+    
+    If input_model/output_model are not provided, the decorator will attempt to
+    construct them from the function's type annotations. For parameters, it expects that
+    users can use typing.Annotated to provide extra info via the ArgInfo dataclass.
+    
+    Example usage:
+    
+        @tool
+        def my_tool(x: Annotated[int, ArgInfo(description="number to double", scope="public")]) -> dict:
+            \"\"\"Doubles a number\"\"\"
+            return {"result": x * 2}
     """
+    def decorator(func: Callable) -> "Tool":
+        # Determine tool name and description from provided kwargs or fallback to function attributes.
+        name = d_kwargs.get("name") or func.__name__
+        description = d_kwargs.get("description") or func.__doc__ or ""
+        scope = d_kwargs.get("scope")  # might be None, later we set a default.
+        default_inputs = d_kwargs.get("default_inputs", {})
+        default_outputs = d_kwargs.get("default_outputs", {})
+        input_model = d_kwargs.get("input_model")
+        output_model = d_kwargs.get("output_model")
+        
+        # Build input_model if not explicitly provided.
+        if input_model is None:
+            sig = inspect.signature(func)
+            properties = {}
+            required = []
+            for param in sig.parameters.values():
+                if param.name == "self":
+                    continue  # Skip instance methods' self.
+                # Extract type annotation and any extra metadata from Annotated.
+                annotation = param.annotation
+                extra: Any = None
+                if get_origin(annotation) is not None and get_origin(annotation) is not Annotated:
+                    # If it’s not Annotated, leave it as is.
+                    pass
+                if get_origin(annotation) is Annotated:
+                    args = get_args(annotation)
+                    # First argument is the actual type.
+                    annotation = args[0]
+                    # Look for an ArgInfo instance in the remaining arguments.
+                    for meta in args[1:]:
+                        if isinstance(meta, ArgInfo):
+                            extra = meta
+                            break
+                # Without explicit ArgInfo metadata, we still provide defaults.
+                if extra is None:
+                    extra = ArgInfo()
+                # Build the JSON schema property.
+                prop_schema = type_to_jsonschema(annotation)
+                if extra.description:
+                    prop_schema["description"] = extra.description
+                prop_schema["scope"] = extra.scope
+                properties[param.name] = prop_schema
+                # If the parameter has no default, mark it as required.
+                if param.default is param.empty:
+                    required.append(param.name)
+                else:
+                    # Use the function default if available.
+                    default_inputs.setdefault(param.name, param.default)
+            input_model = {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            }
+        
+        # Build output_model if not explicitly provided.
+        if output_model is None:
+            sig = inspect.signature(func)
+            ret_annotation = sig.return_annotation
+            if ret_annotation is inspect.Signature.empty:
+                raise ValueError("No explicit output_model provided and function return annotation is missing.")
+            extra = None
+            if get_origin(ret_annotation) is Annotated:
+                args = get_args(ret_annotation)
+                ret_annotation = args[0]
+                for meta in args[1:]:
+                    if isinstance(meta, ArgInfo):
+                        extra = meta
+                        break
+            # For simplicity, we assume the output is always a dict with a key "result".
+            result_schema = type_to_jsonschema(ret_annotation)
+            if extra and extra.description:
+                result_schema["description"] = extra.description
+            output_model = {
+                "type": "object",
+                "properties": {"result": result_schema},
+                "required": ["result"],
+            }
+        
+        # If no scope is provided, set a default (assume Scope.PUBLIC is defined in the types module).
+        if scope is None:
+            from c1.genai.compound_ai.tools.types import Scope as ImportedScope
+            scope = ImportedScope.PUBLIC
+        
+        # Determine if the function is asynchronous.
+        is_async = asyncio.iscoroutinefunction(func)
+        from c1.genai.compound_ai.tools.tool import Tool  # import the Tool class.
+        if is_async:
+            tool_instance = Tool(
+                name=name,
+                description=description,
+                input_model=input_model,
+                output_model=output_model,
+                scope=scope,
+                default_inputs=default_inputs,
+                default_outputs=default_outputs,
+                coroutine=func
+            )
+        else:
+            tool_instance = Tool(
+                name=name,
+                description=description,
+                input_model=input_model,
+                output_model=output_model,
+                scope=scope,
+                default_inputs=default_inputs,
+                default_outputs=default_outputs,
+                func=func
+            )
+        return tool_instance
 
-    # Simulate "author library" code.
-    def register_author_tool():
-        registry = ToolRegistry()  # same import path as user
-        author_tool = Tool(
-            name="author_tool",
-            description="Tool from the author library",
-            input_model={"type": "object", "properties": {}},
-            output_model={"type": "object", "properties": {}},
-            scope=Scope.PUBLIC,
-            func=lambda: {"result": "author"}
-        )
-        registry.add_tool(author_tool)
-
-    # Simulate "user library" code.
-    def get_registered_tools():
-        registry = ToolRegistry()  # same import path as author
-        return registry.list_tools()
-
-    # Step 1: Author library registers its tool.
-    register_author_tool()
-
-    # Step 2: User library retrieves what's in the registry.
-    tools = get_registered_tools()
-    tool_names = [t.name for t in tools]
-
-    assert "author_tool" in tool_names, (
-        "Expected to find the tool registered by the author library. "
-        "The user library doesn't see it, which suggests a mismatch in imports!"
-    )
+    # If the decorator is used without arguments, the first positional argument is the function.
+    if d_args and callable(d_args[0]):
+        return decorator(d_args[0])
+    else:
+        return decorator
