@@ -1,210 +1,227 @@
-To generate a JSON Schema from a Python function's signature without using Pydantic, you can utilize Python's built-in `inspect` module to introspect the function's parameters and their type annotations. Here's a step-by-step guide to creating a utility function that performs this task:
+import pytest
+import asyncio
+from typing import Annotated, Union, Optional
+from pydantic import BaseModel, Field
+from jsonschema.exceptions import ValidationError
 
-1. **Import Necessary Modules**:
-   Begin by importing the `inspect` module for introspection and the `typing` module to handle advanced type hints.
-
-   ```python
-   import inspect
-   from typing import get_type_hints, Union, List, Dict, Any
-   ```
-
-
-2. **Define a Type Mapping**:
-   Create a dictionary that maps Python types to their corresponding JSON Schema types. This mapping will help translate Python type hints into JSON Schema property definitions.
-
-   ```python
-   python_to_json_schema = {
-       str: {"type": "string"},
-       int: {"type": "integer"},
-       float: {"type": "number"},
-       bool: {"type": "boolean"},
-       list: {"type": "array"},
-       dict: {"type": "object"},
-       type(None): {"type": "null"},
-   }
-   ```
-
-
-3. **Handle Complex Types**:
-   Define a function to process complex types such as `List`, `Dict`, and `Union`. This function will recursively determine the appropriate JSON Schema representation for these types.
-
-   ```python
-   def get_json_schema_type(py_type: Any) -> Dict[str, Any]:
-       if py_type in python_to_json_schema:
-           return python_to_json_schema[py_type]
-       elif hasattr(py_type, "__origin__"):
-           origin = py_type.__origin__
-           args = py_type.__args__
-           if origin is list or origin is List:
-               return {"type": "array", "items": get_json_schema_type(args[0])}
-           elif origin is dict or origin is Dict:
-               return {"type": "object", "additionalProperties": get_json_schema_type(args[1])}
-           elif origin is Union:
-               return {"anyOf": [get_json_schema_type(arg) for arg in args]}
-       return {"type": "string"}  # Default fallback
-   ```
-
-
-4. **Extract Function Metadata**:
-   Create a function that extracts the function's name, docstring, parameters, and their respective types to construct the JSON Schema.
-
-   ```python
-   def generate_json_schema_from_function(func) -> Dict[str, Any]:
-       schema = {
-           "title": func.__name__,
-           "description": inspect.getdoc(func),
-           "type": "object",
-           "properties": {},
-           "required": [],
-       }
-
-       sig = inspect.signature(func)
-       type_hints = get_type_hints(func)
-
-       for param_name, param in sig.parameters.items():
-           if param_name == "return":
-               continue
-
-           param_type = type_hints.get(param_name, Any)
-           json_type = get_json_schema_type(param_type)
-
-           schema["properties"][param_name] = json_type
-
-           if param.default == inspect.Parameter.empty:
-               schema["required"].append(param_name)
-
-       if not schema["required"]:
-           del schema["required"]
-
-       return schema
-   ```
-
-
-5. **Example Usage**:
-   Define a sample function with type annotations and generate its JSON Schema using the utility function.
-
-   ```python
-   def example_function(name: str, age: int, interests: List[str], preferences: Dict[str, bool], active: bool = True) -> None:
-       """
-       An example function that demonstrates various parameter types.
-       """
-       pass
-
-   schema = generate_json_schema_from_function(example_function)
-   print(schema)
-   ```
-
-
-   **Output**:
-   ```json
-   {
-       "title": "example_function",
-       "description": "An example function that demonstrates various parameter types.",
-       "type": "object",
-       "properties": {
-           "name": {"type": "string"},
-           "age": {"type": "integer"},
-           "interests": {"type": "array", "items": {"type": "string"}},
-           "preferences": {"type": "object", "additionalProperties": {"type": "boolean"}},
-           "active": {"type": "boolean"}
-       },
-       "required": ["name", "age", "interests", "preferences"]
-   }
-   ```
-
-
-   In this output:
-   - The `title` is the function's name.
-   - The `description` is extracted from the function's docstring.
-   - The `properties` dictionary contains each parameter with its corresponding JSON Schema type.
-   - The `required` list includes parameters that do not have default values.
-
-**Notes**:
-- This utility function supports basic Python types and common generics like `List`, `Dict`, and `Union`. You can extend the `get_json_schema_type` function to handle additional complex types as needed.
-- The function relies on type hints; parameters without type annotations will default to a JSON Schema type of `string`.
-- This approach does not depend on external libraries like Pydantic, making it suitable for projects where you prefer to avoid additional dependencies.
-
-By utilizing Python's introspection capabilities, this utility function provides a straightforward method to generate JSON Schemas directly from function definitions, facilitating tasks such as validation, documentation, and integration with systems that utilize JSON Schema. 
+from your_package.decorator import tool
+from your_package.tool import Tool
+from your_package.types import ArgInfo, Scope
 
 
-import inspect
-from typing import (
-    Annotated, get_origin, get_args,
-    Union, List, Dict, Any, get_type_hints
-)
-from pydantic import BaseModel
+# -------------------------
+# Models for Tests
+# -------------------------
 
-# Base Python types to JSON Schema
-type_map = {
-    str: {"type": "string"},
-    int: {"type": "integer"},
-    float: {"type": "number"},
-    bool: {"type": "boolean"},
-    list: {"type": "array"},
-    dict: {"type": "object"},
-    type(None): {"type": "null"},
-}
+class MyInputModel(BaseModel):
+    name: str
+    age: int = 18
 
-def resolve_type(py_type: Any, defs: dict) -> dict:
-    # Handle Annotated
-    if get_origin(py_type) is Annotated:
-        base_type, *extras = get_args(py_type)
-        schema = resolve_type(base_type, defs)
-        for extra in extras:
-            if isinstance(extra, ArgInfo):
-                schema.update(extra.info)
-        return schema
+class MyOutputModel(BaseModel):
+    message: str
+    code: int = 200
 
-    # Handle standard types
-    if py_type in type_map:
-        return type_map[py_type]
+class NestedAddress(BaseModel):
+    street: str
+    zip: str
 
-    # Handle generic types
-    origin = get_origin(py_type)
-    args = get_args(py_type)
+class NestedUser(BaseModel):
+    name: str
+    address: NestedAddress
 
-    if origin is Union:
-        return {"anyOf": [resolve_type(arg, defs) for arg in args]}
-    elif origin in (list, List):
-        return {"type": "array", "items": resolve_type(args[0], defs)}
-    elif origin in (dict, Dict):
-        return {"type": "object", "additionalProperties": resolve_type(args[1], defs)}
+class SimpleOutput(BaseModel):
+    result: int
 
-    # Handle Pydantic models
-    if hasattr(py_type, "model_json_schema"):
-        model_name = py_type.__name__
-        if model_name not in defs:
-            defs[model_name] = py_type.model_json_schema(ref_template="#/$defs/{model}")
-        return {"$ref": f"#/$defs/{model_name}"}
+class ResultModel(BaseModel):
+    greeting: str
+    is_adult: bool
 
-    return {"type": "string"}  # fallback
+class OutputWrap(BaseModel):
+    wrapped: str
 
-def generate_json_schema_from_function(func) -> dict:
-    sig = inspect.signature(func)
-    type_hints = get_type_hints(func, include_extras=True)
 
-    schema = {
-        "title": func.__name__,
-        "description": inspect.getdoc(func) or "",
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "$defs": {}
-    }
+# -------------------------
+# Tool Definitions
+# -------------------------
 
-    for name, param in sig.parameters.items():
-        if name == "return":
-            continue
-        annotation = type_hints.get(name, Any)
-        field_schema = resolve_type(annotation, schema["$defs"])
-        schema["properties"][name] = field_schema
-        if param.default is inspect.Parameter.empty:
-            schema["required"].append(name)
+@tool
+def basic_tool(a: int, b: int) -> int:
+    return a + b
 
-    if not schema["required"]:
-        schema.pop("required")
+@tool
+def hierarchical_defaults_tool(x: Annotated[int, ArgInfo(default=111)] = 222) -> int:
+    return x
 
-    if not schema["$defs"]:
-        schema.pop("$defs")
+@tool
+def tool_with_metadata(
+    a: Annotated[int, ArgInfo(description="A value")] = 1
+) -> int:
+    return a * 10
 
-    return schema
+@tool
+def pydantic_input_tool(user: MyInputModel) -> MyOutputModel:
+    return MyOutputModel(message=f"Hello {user.name}", code=200)
+
+@tool
+def pydantic_output_tool(x: int) -> SimpleOutput:
+    return SimpleOutput(result=x * 10)
+
+@tool
+def annotated_tool(
+    a: Annotated[int, ArgInfo(description="an int", default=1)],
+    b: Annotated[str, ArgInfo(description="a string", default="hi")]
+) -> str:
+    return f"{a}:{b}"
+
+@tool
+def union_tool(val: Union[int, str]) -> str:
+    return str(val)
+
+@tool
+def optional_tool(msg: Optional[str] = None) -> str:
+    return msg or "empty"
+
+@tool
+def no_input_tool() -> str:
+    return "static"
+
+@tool(output_model=SimpleOutput)
+def invalid_output() -> dict:
+    return {"wrong_field": 1}
+
+@tool
+def nested_tool(user: NestedUser) -> str:
+    return user.address.street
+
+def must_be_even(data):
+    if data["x"] % 2 != 0:
+        raise ValueError("x must be even")
+
+@tool(input_validator=must_be_even)
+def even_tool(x: int) -> int:
+    return x // 2
+
+def log_it(func):
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+@tool
+@log_it
+def decorated(x: int) -> int:
+    return x * 2
+
+with pytest.raises(TypeError):
+    @tool
+    def has_kwargs(**kwargs):
+        return kwargs
+
+with pytest.raises(TypeError):
+    @tool
+    def has_args(*args):
+        return sum(args)
+
+class NotSerializable:
+    pass
+
+with pytest.raises(TypeError):
+    @tool
+    def bad_type(x: NotSerializable): ...
+
+@tool
+def scoped_tool(
+    a: Annotated[int, ArgInfo(scope=Scope.PUBLIC, default=1)],
+    b: Annotated[int, ArgInfo(scope=Scope.PROTECTED, default=2)],
+    c: Annotated[int, ArgInfo(scope=Scope.PRIVATE, default=3)],
+) -> int:
+    return a + b + c
+
+@tool
+def greet_user(user: MyInputModel) -> ResultModel:
+    return ResultModel(greeting=f"Hi, {user.name}!", is_adult=user.age >= 18)
+
+
+# -------------------------
+# Tests
+# -------------------------
+
+def test_basic_add():
+    assert basic_tool(a=1, b=2) == 3
+
+def test_hierarchical_default():
+    assert hierarchical_defaults_tool() == 222
+    assert hierarchical_defaults_tool(x=5) == 5
+
+def test_metadata_and_schema():
+    result = tool_with_metadata()
+    assert result == 10
+    schema = tool_with_metadata.input_model
+    assert schema["properties"]["a"]["description"] == "A value"
+
+def test_pydantic_input_with_dict():
+    result = pydantic_input_tool(user={"name": "Alice", "age": 30})
+    assert result["message"] == "Hello Alice"
+
+def test_pydantic_input_with_instance():
+    user = MyInputModel(name="Bob", age=25)
+    result = pydantic_input_tool(user=user)
+    assert result["message"] == "Hello Bob"
+
+def test_pydantic_output_schema():
+    result = pydantic_output_tool(x=3)
+    assert result["result"] == 30
+
+def test_annotated_defaults():
+    assert annotated_tool() == "1:hi"
+    assert annotated_tool(a=5, b="ok") == "5:ok"
+
+def test_union_and_optional():
+    assert union_tool(val=123) == "123"
+    assert union_tool(val="abc") == "abc"
+    assert optional_tool() == "empty"
+    assert optional_tool(msg="yo") == "yo"
+
+def test_no_input_output():
+    assert no_input_tool() == "static"
+
+def test_invalid_output_model():
+    with pytest.raises(ValidationError):
+        invalid_output()
+
+def test_nested_model():
+    result = nested_tool(user={"name": "Jane", "address": {"street": "Main", "zip": "12345"}})
+    assert result == "Main"
+
+def test_custom_validator_passes():
+    assert even_tool(x=4) == 2
+
+def test_custom_validator_fails():
+    with pytest.raises(ValueError):
+        even_tool(x=3)
+
+def test_decorator_chain():
+    assert decorated(x=3) == 6
+
+def test_scoped_tool_public():
+    assert scoped_tool() == 6
+    assert set(scoped_tool.parameters.keys()) == {"a"}
+
+def test_scoped_tool_protected():
+    tool2 = scoped_tool.rescope(Scope.PROTECTED)
+    assert set(tool2.parameters.keys()) == {"a", "b"}
+    assert tool2(a=1, b=2) == 6
+
+def test_scoped_tool_private():
+    tool3 = scoped_tool.rescope(Scope.PRIVATE)
+    assert set(tool3.parameters.keys()) == {"a", "b", "c"}
+    assert tool3(a=1, b=1, c=1) == 3
+
+def test_greet_user_dict():
+    result = greet_user(user={"name": "Kim"})
+    assert result["greeting"] == "Hi, Kim!"
+    assert result["is_adult"]
+
+def test_greet_user_model():
+    result = greet_user(user=MyInputModel(name="Sam", age=17))
+    assert result["greeting"] == "Hi, Sam!"
+    assert not result["is_adult"]
