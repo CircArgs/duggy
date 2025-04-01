@@ -1,169 +1,127 @@
-import inspect
-import asyncio
-import functools
-from dataclasses import dataclass
-from typing import Any, Callable, get_origin, get_args
+To generate a JSON Schema from a Python function's signature without using Pydantic, you can utilize Python's built-in `inspect` module to introspect the function's parameters and their type annotations. Here's a step-by-step guide to creating a utility function that performs this task:
 
-# This dataclass is meant to be used as extra annotation metadata for function parameters.
-@dataclass
-class ArgInfo:
-    description: str = ""
-    scope: str = "public"  # could be any string representing a scope, e.g. "public", "private", etc.
+1. **Import Necessary Modules**:
+   Begin by importing the `inspect` module for introspection and the `typing` module to handle advanced type hints.
 
-# A simple mapping function from basic Python types to JSON Schema types.
-def type_to_jsonschema(py_type: type) -> dict:
-    if py_type is int:
-        return {"type": "integer"}
-    elif py_type is float:
-        return {"type": "number"}
-    elif py_type is str:
-        return {"type": "string"}
-    elif py_type is bool:
-        return {"type": "boolean"}
-    elif py_type is list:
-        return {"type": "array"}
-    elif py_type is dict:
-        return {"type": "object"}
-    else:
-        # Fallback: for unsupported types, default to "object"
-        return {"type": "object"}
+   ```python
+   import inspect
+   from typing import get_type_hints, Union, List, Dict, Any
+   ```
+
 
-def tool(*d_args, **d_kwargs):
-    """
-    Decorator to convert a callable into a Tool.
-    
-    Optional keyword arguments:
-      - name: Name for the tool (defaults to function's __name__)
-      - description: Description for the tool (defaults to function's __doc__)
-      - input_model: Explicit JSON schema for inputs.
-      - output_model: Explicit JSON schema for outputs.
-      - scope: Tool scope (if not provided, defaults to Scope.PUBLIC)
-      - default_inputs: Dict of default input values.
-      - default_outputs: Dict of default output values.
-    
-    If input_model/output_model are not provided, the decorator will attempt to
-    construct them from the function's type annotations. For parameters, it expects that
-    users can use typing.Annotated to provide extra info via the ArgInfo dataclass.
-    
-    Example usage:
-    
-        @tool
-        def my_tool(x: Annotated[int, ArgInfo(description="number to double", scope="public")]) -> dict:
-            \"\"\"Doubles a number\"\"\"
-            return {"result": x * 2}
-    """
-    def decorator(func: Callable) -> "Tool":
-        # Determine tool name and description from provided kwargs or fallback to function attributes.
-        name = d_kwargs.get("name") or func.__name__
-        description = d_kwargs.get("description") or func.__doc__ or ""
-        scope = d_kwargs.get("scope")  # might be None, later we set a default.
-        default_inputs = d_kwargs.get("default_inputs", {})
-        default_outputs = d_kwargs.get("default_outputs", {})
-        input_model = d_kwargs.get("input_model")
-        output_model = d_kwargs.get("output_model")
-        
-        # Build input_model if not explicitly provided.
-        if input_model is None:
-            sig = inspect.signature(func)
-            properties = {}
-            required = []
-            for param in sig.parameters.values():
-                if param.name == "self":
-                    continue  # Skip instance methods' self.
-                # Extract type annotation and any extra metadata from Annotated.
-                annotation = param.annotation
-                extra: Any = None
-                if get_origin(annotation) is not None and get_origin(annotation) is not Annotated:
-                    # If it’s not Annotated, leave it as is.
-                    pass
-                if get_origin(annotation) is Annotated:
-                    args = get_args(annotation)
-                    # First argument is the actual type.
-                    annotation = args[0]
-                    # Look for an ArgInfo instance in the remaining arguments.
-                    for meta in args[1:]:
-                        if isinstance(meta, ArgInfo):
-                            extra = meta
-                            break
-                # Without explicit ArgInfo metadata, we still provide defaults.
-                if extra is None:
-                    extra = ArgInfo()
-                # Build the JSON schema property.
-                prop_schema = type_to_jsonschema(annotation)
-                if extra.description:
-                    prop_schema["description"] = extra.description
-                prop_schema["scope"] = extra.scope
-                properties[param.name] = prop_schema
-                # If the parameter has no default, mark it as required.
-                if param.default is param.empty:
-                    required.append(param.name)
-                else:
-                    # Use the function default if available.
-                    default_inputs.setdefault(param.name, param.default)
-            input_model = {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            }
-        
-        # Build output_model if not explicitly provided.
-        if output_model is None:
-            sig = inspect.signature(func)
-            ret_annotation = sig.return_annotation
-            if ret_annotation is inspect.Signature.empty:
-                raise ValueError("No explicit output_model provided and function return annotation is missing.")
-            extra = None
-            if get_origin(ret_annotation) is Annotated:
-                args = get_args(ret_annotation)
-                ret_annotation = args[0]
-                for meta in args[1:]:
-                    if isinstance(meta, ArgInfo):
-                        extra = meta
-                        break
-            # For simplicity, we assume the output is always a dict with a key "result".
-            result_schema = type_to_jsonschema(ret_annotation)
-            if extra and extra.description:
-                result_schema["description"] = extra.description
-            output_model = {
-                "type": "object",
-                "properties": {"result": result_schema},
-                "required": ["result"],
-            }
-        
-        # If no scope is provided, set a default (assume Scope.PUBLIC is defined in the types module).
-        if scope is None:
-            from c1.genai.compound_ai.tools.types import Scope as ImportedScope
-            scope = ImportedScope.PUBLIC
-        
-        # Determine if the function is asynchronous.
-        is_async = asyncio.iscoroutinefunction(func)
-        from c1.genai.compound_ai.tools.tool import Tool  # import the Tool class.
-        if is_async:
-            tool_instance = Tool(
-                name=name,
-                description=description,
-                input_model=input_model,
-                output_model=output_model,
-                scope=scope,
-                default_inputs=default_inputs,
-                default_outputs=default_outputs,
-                coroutine=func
-            )
-        else:
-            tool_instance = Tool(
-                name=name,
-                description=description,
-                input_model=input_model,
-                output_model=output_model,
-                scope=scope,
-                default_inputs=default_inputs,
-                default_outputs=default_outputs,
-                func=func
-            )
-        return tool_instance
+2. **Define a Type Mapping**:
+   Create a dictionary that maps Python types to their corresponding JSON Schema types. This mapping will help translate Python type hints into JSON Schema property definitions.
 
-    # If the decorator is used without arguments, the first positional argument is the function.
-    if d_args and callable(d_args[0]):
-        return decorator(d_args[0])
-    else:
-        return decorator
+   ```python
+   python_to_json_schema = {
+       str: {"type": "string"},
+       int: {"type": "integer"},
+       float: {"type": "number"},
+       bool: {"type": "boolean"},
+       list: {"type": "array"},
+       dict: {"type": "object"},
+       type(None): {"type": "null"},
+   }
+   ```
+
+
+3. **Handle Complex Types**:
+   Define a function to process complex types such as `List`, `Dict`, and `Union`. This function will recursively determine the appropriate JSON Schema representation for these types.
+
+   ```python
+   def get_json_schema_type(py_type: Any) -> Dict[str, Any]:
+       if py_type in python_to_json_schema:
+           return python_to_json_schema[py_type]
+       elif hasattr(py_type, "__origin__"):
+           origin = py_type.__origin__
+           args = py_type.__args__
+           if origin is list or origin is List:
+               return {"type": "array", "items": get_json_schema_type(args[0])}
+           elif origin is dict or origin is Dict:
+               return {"type": "object", "additionalProperties": get_json_schema_type(args[1])}
+           elif origin is Union:
+               return {"anyOf": [get_json_schema_type(arg) for arg in args]}
+       return {"type": "string"}  # Default fallback
+   ```
+
+
+4. **Extract Function Metadata**:
+   Create a function that extracts the function's name, docstring, parameters, and their respective types to construct the JSON Schema.
+
+   ```python
+   def generate_json_schema_from_function(func) -> Dict[str, Any]:
+       schema = {
+           "title": func.__name__,
+           "description": inspect.getdoc(func),
+           "type": "object",
+           "properties": {},
+           "required": [],
+       }
+
+       sig = inspect.signature(func)
+       type_hints = get_type_hints(func)
+
+       for param_name, param in sig.parameters.items():
+           if param_name == "return":
+               continue
+
+           param_type = type_hints.get(param_name, Any)
+           json_type = get_json_schema_type(param_type)
+
+           schema["properties"][param_name] = json_type
+
+           if param.default == inspect.Parameter.empty:
+               schema["required"].append(param_name)
+
+       if not schema["required"]:
+           del schema["required"]
+
+       return schema
+   ```
+
+
+5. **Example Usage**:
+   Define a sample function with type annotations and generate its JSON Schema using the utility function.
+
+   ```python
+   def example_function(name: str, age: int, interests: List[str], preferences: Dict[str, bool], active: bool = True) -> None:
+       """
+       An example function that demonstrates various parameter types.
+       """
+       pass
+
+   schema = generate_json_schema_from_function(example_function)
+   print(schema)
+   ```
+
+
+   **Output**:
+   ```json
+   {
+       "title": "example_function",
+       "description": "An example function that demonstrates various parameter types.",
+       "type": "object",
+       "properties": {
+           "name": {"type": "string"},
+           "age": {"type": "integer"},
+           "interests": {"type": "array", "items": {"type": "string"}},
+           "preferences": {"type": "object", "additionalProperties": {"type": "boolean"}},
+           "active": {"type": "boolean"}
+       },
+       "required": ["name", "age", "interests", "preferences"]
+   }
+   ```
+
+
+   In this output:
+   - The `title` is the function's name.
+   - The `description` is extracted from the function's docstring.
+   - The `properties` dictionary contains each parameter with its corresponding JSON Schema type.
+   - The `required` list includes parameters that do not have default values.
+
+**Notes**:
+- This utility function supports basic Python types and common generics like `List`, `Dict`, and `Union`. You can extend the `get_json_schema_type` function to handle additional complex types as needed.
+- The function relies on type hints; parameters without type annotations will default to a JSON Schema type of `string`.
+- This approach does not depend on external libraries like Pydantic, making it suitable for projects where you prefer to avoid additional dependencies.
+
+By utilizing Python's introspection capabilities, this utility function provides a straightforward method to generate JSON Schemas directly from function definitions, facilitating tasks such as validation, documentation, and integration with systems that utilize JSON Schema. 
