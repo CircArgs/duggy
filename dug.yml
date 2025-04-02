@@ -1,55 +1,103 @@
-def filter_schema(schema: Dict[str, Any],
-                  comparator: Callable[[int], bool]) -> Dict[str, Any]:
+def instantiate_schema_values(schema: Dict[str, Any],
+                              inputs: Dict[str, Any],
+                              defaults: Dict[str, Any],
+                              comparator: Callable[[int], bool]) -> Any:
     """
-    Recursively filters a JSON schema by removing any field (dictionary key/value pair
-    or list element) that is a dictionary with a 'scope' attribute such that:
+    Recursively instantiate a full value (or dictionary) by walking a JSON schema,
+    resolving any $ref references (assumed to be of the form "#/...") and, for each
+    field, selecting its value from either the inputs or defaults dictionary.
+
+    For a given schema node, if it has a 'scope' attribute (defaulting to Scope.PUBLIC)
+    and if:
     
          comparator(node.get('scope', Scope.PUBLIC)) is True
-    
-    Parameters:
-      schema (dict): The JSON schema as a dictionary (may include $ref references).
-      comparator (Callable[[int], bool]): A function that takes a scope value (an int)
-          and returns True if the entire field should be removed.
-    
-    Returns:
-      dict: A new JSON schema dictionary with the matching fields removed.
-    """
-    # Work on a deep copy to avoid modifying the original schema.
-    schema_copy = deepcopy(schema)
-    # Memoization dictionary to help prevent infinite recursion with cyclic references.
-    memo = {}
 
-    def _filter(node: Any) -> Any:
-        # Process dictionaries.
+    then the value for that node is taken from the defaults dictionary (using the same
+    key path); otherwise it is taken from the inputs dictionary.
+
+    The schema is expected to be the full (root) schema—so any $ref is resolved using the
+    passed schema as the root.
+
+    Parameters:
+      schema (dict): The JSON schema as a dictionary.
+      inputs (dict): A dictionary of input values following the schema’s shape.
+      defaults (dict): A dictionary of default values following the schema’s shape.
+      comparator (Callable[[int], bool]): A function that takes a scope value (int) and
+          returns True if that field’s value should be taken from defaults.
+
+    Returns:
+      The instantiated value (or dictionary) constructed by merging values from inputs
+      and defaults per the scope criteria.
+    """
+    # We treat the passed schema as the root for resolving any $ref.
+    root_schema = schema
+
+    def _resolve_ref(node: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolves a $ref within the schema. This implementation supports references
+        in the form "#/definitions/NAME" (or similar).
+        """
+        ref = node.get("$ref")
+        if ref and ref.startswith("#/"):
+            parts = ref.lstrip("#/").split("/")
+            resolved = root_schema
+            for part in parts:
+                resolved = resolved.get(part)
+                if resolved is None:
+                    raise ValueError(f"Could not resolve reference: {ref}")
+            return resolved
+        return node
+
+    def _instantiate(node: Any, inp: Any, dflt: Any) -> Any:
+        """
+        Recursively instantiate a value given a schema node, looking up the corresponding
+        values from the inputs and defaults.
+        """
+        # If the node is a dictionary, it represents a schema fragment.
         if isinstance(node, dict):
-            node_id = id(node)
-            if node_id in memo:
-                return memo[node_id]
-            # If the node itself qualifies for removal, mark it as removed.
-            if 'scope' in node:
-                scope_value = node.get('scope', Scope.PUBLIC)
+            # If there's a $ref, resolve it.
+            if "$ref" in node:
+                node = _resolve_ref(node)
+            # If the node itself defines a 'scope', make a decision.
+            if "scope" in node:
+                scope_value = node.get("scope", Scope.PUBLIC)
+                # If the comparator returns True, choose the default value.
                 if comparator(scope_value):
-                    memo[node_id] = None
+                    return dflt
+                else:
+                    return inp
+            # If the node is an object with defined properties, merge recursively.
+            if node.get("type") == "object" and "properties" in node:
+                result = {}
+                for key, prop_schema in node["properties"].items():
+                    child_inp = inp.get(key) if (inp and isinstance(inp, dict)) else None
+                    child_dflt = dflt.get(key) if (dflt and isinstance(dflt, dict)) else None
+                    result[key] = _instantiate(prop_schema, child_inp, child_dflt)
+                return result
+            # For arrays, process each element according to the 'items' schema.
+            elif node.get("type") == "array" and "items" in node:
+                # If the array node had a scope, it would have been handled above.
+                chosen_list = inp if inp is not None else dflt
+                if chosen_list is None:
                     return None
-            # Otherwise, process its children.
-            new_node = {}
-            memo[node_id] = new_node  # Store early to handle potential cycles.
-            for key, value in node.items():
-                filtered_value = _filter(value)
-                # Only add the key if the filtered value is not None.
-                if filtered_value is not None:
-                    new_node[key] = filtered_value
-            return new_node
-        # Process lists by filtering each element.
+                if not isinstance(chosen_list, list):
+                    raise ValueError("Expected a list for an array type field")
+                result_list = []
+                for i in range(len(chosen_list)):
+                    child_inp = inp[i] if (inp and isinstance(inp, list) and i < len(inp)) else None
+                    child_dflt = dflt[i] if (dflt and isinstance(dflt, list) and i < len(dflt)) else None
+                    result_list.append(_instantiate(node["items"], child_inp, child_dflt))
+                return result_list
+            else:
+                # For primitive types or schema nodes without further structure,
+                # simply choose the value from inputs (or defaults if inputs is None).
+                return inp if inp is not None else dflt
+        # If the schema node is a list (uncommon in JSON Schema), process each element.
         elif isinstance(node, list):
-            new_list = []
-            for item in node:
-                filtered_item = _filter(item)
-                if filtered_item is not None:
-                    new_list.append(filtered_item)
-            return new_list
-        # For other types, return as is.
+            return [_instantiate(item, inp, dflt) for item in node]
         else:
+            # For literal values, return them directly.
             return node
 
-    return _filter(schema_copy)
+    # Start instantiation using the passed schema as the blueprint.
+    return _instantiate(schema, inputs, defaults)
