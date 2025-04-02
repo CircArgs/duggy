@@ -1,103 +1,101 @@
-def instantiate_schema_values(schema: Dict[str, Any],
-                              inputs: Dict[str, Any],
-                              defaults: Dict[str, Any],
-                              comparator: Callable[[int], bool]) -> Any:
+from copy import deepcopy
+from enum import IntEnum
+from typing import Any, Callable
+
+class Scope(IntEnum):
+    PUBLIC = 0
+    PRIVATE = 1
+
+def _resolve_ref(node: dict[str, Any], root_schema: dict[str, Any]) -> dict[str, Any]:
+    """Resolves a $ref in node using root_schema (expects format "#/...")."""
+    ref = node.get("$ref")
+    if ref and ref.startswith("#/"):
+        parts = ref.lstrip("#/").split("/")
+        resolved = root_schema
+        for part in parts:
+            resolved = resolved.get(part)
+            if resolved is None:
+                raise ValueError(f"Could not resolve reference: {ref}")
+        return resolved
+    return node
+
+def instantiate_schema_values(
+    schema: dict[str, Any],
+    inputs: dict[str, Any],
+    defaults: dict[str, Any],
+    comparator: Callable[[int], bool]
+) -> Any:
     """
-    Recursively instantiate a full value (or dictionary) by walking a JSON schema,
-    resolving any $ref references (assumed to be of the form "#/...") and, for each
-    field, selecting its value from either the inputs or defaults dictionary.
-
-    For a given schema node, if it has a 'scope' attribute (defaulting to Scope.PUBLIC)
-    and if:
-    
-         comparator(node.get('scope', Scope.PUBLIC)) is True
-
-    then the value for that node is taken from the defaults dictionary (using the same
-    key path); otherwise it is taken from the inputs dictionary.
-
-    The schema is expected to be the full (root) schema—so any $ref is resolved using the
-    passed schema as the root.
-
-    Parameters:
-      schema (dict): The JSON schema as a dictionary.
-      inputs (dict): A dictionary of input values following the schema’s shape.
-      defaults (dict): A dictionary of default values following the schema’s shape.
-      comparator (Callable[[int], bool]): A function that takes a scope value (int) and
-          returns True if that field’s value should be taken from defaults.
-
-    Returns:
-      The instantiated value (or dictionary) constructed by merging values from inputs
-      and defaults per the scope criteria.
+    Recursively instantiates values per schema by choosing from inputs or defaults.
+    For nodes with a "scope", uses defaults if comparator(scope) is True; otherwise, uses inputs.
+    Resolves $ref using the top-level schema.
     """
-    # We treat the passed schema as the root for resolving any $ref.
-    root_schema = schema
-
-    def _resolve_ref(node: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Resolves a $ref within the schema. This implementation supports references
-        in the form "#/definitions/NAME" (or similar).
-        """
-        ref = node.get("$ref")
-        if ref and ref.startswith("#/"):
-            parts = ref.lstrip("#/").split("/")
-            resolved = root_schema
-            for part in parts:
-                resolved = resolved.get(part)
-                if resolved is None:
-                    raise ValueError(f"Could not resolve reference: {ref}")
-            return resolved
-        return node
-
-    def _instantiate(node: Any, inp: Any, dflt: Any) -> Any:
-        """
-        Recursively instantiate a value given a schema node, looking up the corresponding
-        values from the inputs and defaults.
-        """
-        # If the node is a dictionary, it represents a schema fragment.
+    def _instantiate(node: Any, inp: Any, dflt: Any, root: dict[str, Any]) -> Any:
         if isinstance(node, dict):
-            # If there's a $ref, resolve it.
             if "$ref" in node:
-                node = _resolve_ref(node)
-            # If the node itself defines a 'scope', make a decision.
+                node = _resolve_ref(node, root)
             if "scope" in node:
                 scope_value = node.get("scope", Scope.PUBLIC)
-                # If the comparator returns True, choose the default value.
-                if comparator(scope_value):
-                    return dflt
-                else:
-                    return inp
-            # If the node is an object with defined properties, merge recursively.
+                return dflt if comparator(scope_value) else inp
             if node.get("type") == "object" and "properties" in node:
                 result = {}
                 for key, prop_schema in node["properties"].items():
                     child_inp = inp.get(key) if (inp and isinstance(inp, dict)) else None
                     child_dflt = dflt.get(key) if (dflt and isinstance(dflt, dict)) else None
-                    result[key] = _instantiate(prop_schema, child_inp, child_dflt)
+                    result[key] = _instantiate(prop_schema, child_inp, child_dflt, root)
                 return result
-            # For arrays, process each element according to the 'items' schema.
-            elif node.get("type") == "array" and "items" in node:
-                # If the array node had a scope, it would have been handled above.
+            if node.get("type") == "array" and "items" in node:
                 chosen_list = inp if inp is not None else dflt
                 if chosen_list is None:
                     return None
                 if not isinstance(chosen_list, list):
-                    raise ValueError("Expected a list for an array type field")
+                    raise ValueError("Expected a list for array type field")
                 result_list = []
                 for i in range(len(chosen_list)):
                     child_inp = inp[i] if (inp and isinstance(inp, list) and i < len(inp)) else None
                     child_dflt = dflt[i] if (dflt and isinstance(dflt, list) and i < len(dflt)) else None
-                    result_list.append(_instantiate(node["items"], child_inp, child_dflt))
+                    result_list.append(_instantiate(node["items"], child_inp, child_dflt, root))
                 return result_list
-            else:
-                # For primitive types or schema nodes without further structure,
-                # simply choose the value from inputs (or defaults if inputs is None).
-                return inp if inp is not None else dflt
-        # If the schema node is a list (uncommon in JSON Schema), process each element.
-        elif isinstance(node, list):
-            return [_instantiate(item, inp, dflt) for item in node]
-        else:
-            # For literal values, return them directly.
-            return node
+            return inp if inp is not None else dflt
+        if isinstance(node, list):
+            return [_instantiate(item, inp, dflt, root) for item in node]
+        return node
 
-    # Start instantiation using the passed schema as the blueprint.
-    return _instantiate(schema, inputs, defaults)
+    return _instantiate(schema, inputs, defaults, schema)
+
+def populate_defaults_with_schema(
+    defaults: dict[str, Any],
+    schema: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Recursively populates missing defaults from schema into the defaults dict.
+    For object properties with a "default" key absent in defaults, adds that default.
+    Resolves $ref using the top-level schema.
+    """
+    def _populate(defs: dict[str, Any], sch: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+        result = dict(defs) if defs is not None else {}
+        if "$ref" in sch:
+            sch = _resolve_ref(sch, root)
+        if sch.get("type") == "object" and "properties" in sch:
+            for key, prop_schema in sch["properties"].items():
+                if isinstance(prop_schema, dict) and "$ref" in prop_schema:
+                    prop_schema = _resolve_ref(prop_schema, root)
+                if key not in result:
+                    if "default" in prop_schema:
+                        result[key] = deepcopy(prop_schema["default"])
+                    elif prop_schema.get("type") == "object" and "properties" in prop_schema:
+                        result[key] = _populate({}, prop_schema, root)
+                else:
+                    if (isinstance(result[key], dict) and
+                        prop_schema.get("type") == "object" and "properties" in prop_schema):
+                        result[key] = _populate(result[key], prop_schema, root)
+            return result
+        if sch.get("type") == "array" and "items" in sch:
+            if "default" in sch and not result:
+                return deepcopy(sch["default"])
+            return result
+        if not result and "default" in sch:
+            return deepcopy(sch["default"])
+        return result
+
+    return _populate(defaults, schema, schema)
