@@ -1,101 +1,37 @@
-from copy import deepcopy
-from enum import IntEnum
-from typing import Any, Callable
-
-class Scope(IntEnum):
-    PUBLIC = 0
-    PRIVATE = 1
-
-def _resolve_ref(node: dict[str, Any], root_schema: dict[str, Any]) -> dict[str, Any]:
-    """Resolves a $ref in node using root_schema (expects format "#/...")."""
-    ref = node.get("$ref")
-    if ref and ref.startswith("#/"):
-        parts = ref.lstrip("#/").split("/")
-        resolved = root_schema
-        for part in parts:
-            resolved = resolved.get(part)
-            if resolved is None:
-                raise ValueError(f"Could not resolve reference: {ref}")
-        return resolved
-    return node
-
-def instantiate_schema_values(
-    schema: dict[str, Any],
-    inputs: dict[str, Any],
-    defaults: dict[str, Any],
-    comparator: Callable[[int], bool]
-) -> Any:
+def cleanup_filtered_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """
-    Recursively instantiates values per schema by choosing from inputs or defaults.
-    For nodes with a "scope", uses defaults if comparator(scope) is True; otherwise, uses inputs.
-    Resolves $ref using the top-level schema.
+    Second pass to remove dangling references and clean up keywords like "required".
+    Removes any $ref that can't be resolved and, in objects, filters "required" lists to
+    only include keys that exist in the object's "properties".
     """
-    def _instantiate(node: Any, inp: Any, dflt: Any, root: dict[str, Any]) -> Any:
+    def _cleanup(node: Any, root: dict[str, Any]) -> Any:
         if isinstance(node, dict):
+            # Resolve $ref if present.
             if "$ref" in node:
-                node = _resolve_ref(node, root)
-            if "scope" in node:
-                scope_value = node.get("scope", Scope.PUBLIC)
-                return dflt if comparator(scope_value) else inp
-            if node.get("type") == "object" and "properties" in node:
-                result = {}
-                for key, prop_schema in node["properties"].items():
-                    child_inp = inp.get(key) if (inp and isinstance(inp, dict)) else None
-                    child_dflt = dflt.get(key) if (dflt and isinstance(dflt, dict)) else None
-                    result[key] = _instantiate(prop_schema, child_inp, child_dflt, root)
-                return result
-            if node.get("type") == "array" and "items" in node:
-                chosen_list = inp if inp is not None else dflt
-                if chosen_list is None:
+                try:
+                    resolved = _resolve_ref(node, root)
+                    if resolved is None:
+                        return None
+                    node = resolved
+                except ValueError:
                     return None
-                if not isinstance(chosen_list, list):
-                    raise ValueError("Expected a list for array type field")
-                result_list = []
-                for i in range(len(chosen_list)):
-                    child_inp = inp[i] if (inp and isinstance(inp, list) and i < len(inp)) else None
-                    child_dflt = dflt[i] if (dflt and isinstance(dflt, list) and i < len(dflt)) else None
-                    result_list.append(_instantiate(node["items"], child_inp, child_dflt, root))
-                return result_list
-            return inp if inp is not None else dflt
-        if isinstance(node, list):
-            return [_instantiate(item, inp, dflt, root) for item in node]
+            new_node = {}
+            for key, value in node.items():
+                cleaned_value = _cleanup(value, root)
+                if cleaned_value is not None:
+                    new_node[key] = cleaned_value
+            # Clean up "required" arrays: only keep properties that exist.
+            if "required" in new_node and isinstance(new_node["required"], list):
+                if "properties" in new_node and isinstance(new_node["properties"], dict):
+                    new_node["required"] = [
+                        r for r in new_node["required"]
+                        if r in new_node["properties"]
+                    ]
+                else:
+                    new_node.pop("required")
+            return new_node
+        elif isinstance(node, list):
+            return [item for item in (_cleanup(item, root) for item in node) if item is not None]
         return node
 
-    return _instantiate(schema, inputs, defaults, schema)
-
-def populate_defaults_with_schema(
-    defaults: dict[str, Any],
-    schema: dict[str, Any]
-) -> dict[str, Any]:
-    """
-    Recursively populates missing defaults from schema into the defaults dict.
-    For object properties with a "default" key absent in defaults, adds that default.
-    Resolves $ref using the top-level schema.
-    """
-    def _populate(defs: dict[str, Any], sch: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
-        result = dict(defs) if defs is not None else {}
-        if "$ref" in sch:
-            sch = _resolve_ref(sch, root)
-        if sch.get("type") == "object" and "properties" in sch:
-            for key, prop_schema in sch["properties"].items():
-                if isinstance(prop_schema, dict) and "$ref" in prop_schema:
-                    prop_schema = _resolve_ref(prop_schema, root)
-                if key not in result:
-                    if "default" in prop_schema:
-                        result[key] = deepcopy(prop_schema["default"])
-                    elif prop_schema.get("type") == "object" and "properties" in prop_schema:
-                        result[key] = _populate({}, prop_schema, root)
-                else:
-                    if (isinstance(result[key], dict) and
-                        prop_schema.get("type") == "object" and "properties" in prop_schema):
-                        result[key] = _populate(result[key], prop_schema, root)
-            return result
-        if sch.get("type") == "array" and "items" in sch:
-            if "default" in sch and not result:
-                return deepcopy(sch["default"])
-            return result
-        if not result and "default" in sch:
-            return deepcopy(sch["default"])
-        return result
-
-    return _populate(defaults, schema, schema)
+    return _cleanup(schema, schema)
