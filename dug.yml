@@ -1,227 +1,55 @@
-import pytest
-import asyncio
-from typing import Annotated, Union, Optional
-from pydantic import BaseModel, Field
-from jsonschema.exceptions import ValidationError
+def filter_schema(schema: Dict[str, Any],
+                  comparator: Callable[[int], bool]) -> Dict[str, Any]:
+    """
+    Recursively filters a JSON schema by removing any field (dictionary key/value pair
+    or list element) that is a dictionary with a 'scope' attribute such that:
+    
+         comparator(node.get('scope', Scope.PUBLIC)) is True
+    
+    Parameters:
+      schema (dict): The JSON schema as a dictionary (may include $ref references).
+      comparator (Callable[[int], bool]): A function that takes a scope value (an int)
+          and returns True if the entire field should be removed.
+    
+    Returns:
+      dict: A new JSON schema dictionary with the matching fields removed.
+    """
+    # Work on a deep copy to avoid modifying the original schema.
+    schema_copy = deepcopy(schema)
+    # Memoization dictionary to help prevent infinite recursion with cyclic references.
+    memo = {}
 
-from your_package.decorator import tool
-from your_package.tool import Tool
-from your_package.types import ArgInfo, Scope
+    def _filter(node: Any) -> Any:
+        # Process dictionaries.
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in memo:
+                return memo[node_id]
+            # If the node itself qualifies for removal, mark it as removed.
+            if 'scope' in node:
+                scope_value = node.get('scope', Scope.PUBLIC)
+                if comparator(scope_value):
+                    memo[node_id] = None
+                    return None
+            # Otherwise, process its children.
+            new_node = {}
+            memo[node_id] = new_node  # Store early to handle potential cycles.
+            for key, value in node.items():
+                filtered_value = _filter(value)
+                # Only add the key if the filtered value is not None.
+                if filtered_value is not None:
+                    new_node[key] = filtered_value
+            return new_node
+        # Process lists by filtering each element.
+        elif isinstance(node, list):
+            new_list = []
+            for item in node:
+                filtered_item = _filter(item)
+                if filtered_item is not None:
+                    new_list.append(filtered_item)
+            return new_list
+        # For other types, return as is.
+        else:
+            return node
 
-
-# -------------------------
-# Models for Tests
-# -------------------------
-
-class MyInputModel(BaseModel):
-    name: str
-    age: int = 18
-
-class MyOutputModel(BaseModel):
-    message: str
-    code: int = 200
-
-class NestedAddress(BaseModel):
-    street: str
-    zip: str
-
-class NestedUser(BaseModel):
-    name: str
-    address: NestedAddress
-
-class SimpleOutput(BaseModel):
-    result: int
-
-class ResultModel(BaseModel):
-    greeting: str
-    is_adult: bool
-
-class OutputWrap(BaseModel):
-    wrapped: str
-
-
-# -------------------------
-# Tool Definitions
-# -------------------------
-
-@tool
-def basic_tool(a: int, b: int) -> int:
-    return a + b
-
-@tool
-def hierarchical_defaults_tool(x: Annotated[int, ArgInfo(default=111)] = 222) -> int:
-    return x
-
-@tool
-def tool_with_metadata(
-    a: Annotated[int, ArgInfo(description="A value")] = 1
-) -> int:
-    return a * 10
-
-@tool
-def pydantic_input_tool(user: MyInputModel) -> MyOutputModel:
-    return MyOutputModel(message=f"Hello {user.name}", code=200)
-
-@tool
-def pydantic_output_tool(x: int) -> SimpleOutput:
-    return SimpleOutput(result=x * 10)
-
-@tool
-def annotated_tool(
-    a: Annotated[int, ArgInfo(description="an int", default=1)],
-    b: Annotated[str, ArgInfo(description="a string", default="hi")]
-) -> str:
-    return f"{a}:{b}"
-
-@tool
-def union_tool(val: Union[int, str]) -> str:
-    return str(val)
-
-@tool
-def optional_tool(msg: Optional[str] = None) -> str:
-    return msg or "empty"
-
-@tool
-def no_input_tool() -> str:
-    return "static"
-
-@tool(output_model=SimpleOutput)
-def invalid_output() -> dict:
-    return {"wrong_field": 1}
-
-@tool
-def nested_tool(user: NestedUser) -> str:
-    return user.address.street
-
-def must_be_even(data):
-    if data["x"] % 2 != 0:
-        raise ValueError("x must be even")
-
-@tool(input_validator=must_be_even)
-def even_tool(x: int) -> int:
-    return x // 2
-
-def log_it(func):
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
-    return wrapper
-
-@tool
-@log_it
-def decorated(x: int) -> int:
-    return x * 2
-
-with pytest.raises(TypeError):
-    @tool
-    def has_kwargs(**kwargs):
-        return kwargs
-
-with pytest.raises(TypeError):
-    @tool
-    def has_args(*args):
-        return sum(args)
-
-class NotSerializable:
-    pass
-
-with pytest.raises(TypeError):
-    @tool
-    def bad_type(x: NotSerializable): ...
-
-@tool
-def scoped_tool(
-    a: Annotated[int, ArgInfo(scope=Scope.PUBLIC, default=1)],
-    b: Annotated[int, ArgInfo(scope=Scope.PROTECTED, default=2)],
-    c: Annotated[int, ArgInfo(scope=Scope.PRIVATE, default=3)],
-) -> int:
-    return a + b + c
-
-@tool
-def greet_user(user: MyInputModel) -> ResultModel:
-    return ResultModel(greeting=f"Hi, {user.name}!", is_adult=user.age >= 18)
-
-
-# -------------------------
-# Tests
-# -------------------------
-
-def test_basic_add():
-    assert basic_tool(a=1, b=2) == 3
-
-def test_hierarchical_default():
-    assert hierarchical_defaults_tool() == 222
-    assert hierarchical_defaults_tool(x=5) == 5
-
-def test_metadata_and_schema():
-    result = tool_with_metadata()
-    assert result == 10
-    schema = tool_with_metadata.input_model
-    assert schema["properties"]["a"]["description"] == "A value"
-
-def test_pydantic_input_with_dict():
-    result = pydantic_input_tool(user={"name": "Alice", "age": 30})
-    assert result["message"] == "Hello Alice"
-
-def test_pydantic_input_with_instance():
-    user = MyInputModel(name="Bob", age=25)
-    result = pydantic_input_tool(user=user)
-    assert result["message"] == "Hello Bob"
-
-def test_pydantic_output_schema():
-    result = pydantic_output_tool(x=3)
-    assert result["result"] == 30
-
-def test_annotated_defaults():
-    assert annotated_tool() == "1:hi"
-    assert annotated_tool(a=5, b="ok") == "5:ok"
-
-def test_union_and_optional():
-    assert union_tool(val=123) == "123"
-    assert union_tool(val="abc") == "abc"
-    assert optional_tool() == "empty"
-    assert optional_tool(msg="yo") == "yo"
-
-def test_no_input_output():
-    assert no_input_tool() == "static"
-
-def test_invalid_output_model():
-    with pytest.raises(ValidationError):
-        invalid_output()
-
-def test_nested_model():
-    result = nested_tool(user={"name": "Jane", "address": {"street": "Main", "zip": "12345"}})
-    assert result == "Main"
-
-def test_custom_validator_passes():
-    assert even_tool(x=4) == 2
-
-def test_custom_validator_fails():
-    with pytest.raises(ValueError):
-        even_tool(x=3)
-
-def test_decorator_chain():
-    assert decorated(x=3) == 6
-
-def test_scoped_tool_public():
-    assert scoped_tool() == 6
-    assert set(scoped_tool.parameters.keys()) == {"a"}
-
-def test_scoped_tool_protected():
-    tool2 = scoped_tool.rescope(Scope.PROTECTED)
-    assert set(tool2.parameters.keys()) == {"a", "b"}
-    assert tool2(a=1, b=2) == 6
-
-def test_scoped_tool_private():
-    tool3 = scoped_tool.rescope(Scope.PRIVATE)
-    assert set(tool3.parameters.keys()) == {"a", "b", "c"}
-    assert tool3(a=1, b=1, c=1) == 3
-
-def test_greet_user_dict():
-    result = greet_user(user={"name": "Kim"})
-    assert result["greeting"] == "Hi, Kim!"
-    assert result["is_adult"]
-
-def test_greet_user_model():
-    result = greet_user(user=MyInputModel(name="Sam", age=17))
-    assert result["greeting"] == "Hi, Sam!"
-    assert not result["is_adult"]
+    return _filter(schema_copy)
